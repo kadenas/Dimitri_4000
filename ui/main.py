@@ -1,6 +1,6 @@
 import curses
 import time
-import app
+from sip_manager import SIPManager
 
 
 def monitor(stdscr, host="127.0.0.1", port=5060, interval=5):
@@ -11,11 +11,9 @@ def monitor(stdscr, host="127.0.0.1", port=5060, interval=5):
     stdscr.nodelay(True)
     stdscr.timeout(100)
 
+    manager = SIPManager(host, port, interval=interval)
     monitoring = False
-    success = failure = 0
     log = []
-    last_latency = None
-    last_ok = None
     next_time = 0
 
     while True:
@@ -23,30 +21,26 @@ def monitor(stdscr, host="127.0.0.1", port=5060, interval=5):
         stdscr.addstr(0, 0, "SIP Monitor (m=start/stop, i=invite, q=quit)")
         state = "ON" if monitoring else "OFF"
         stdscr.addstr(2, 0, f"Monitoring: {state}")
-        if last_ok is None:
-            stdscr.addstr(3, 0, "Last OPTIONS: -")
-        else:
-            color = curses.color_pair(1 if last_ok else 2)
-            status = "OK" if last_ok else "FAIL"
-            stdscr.addstr(3, 0, f"Last OPTIONS: {status}", color)
-        latency_text = f"{last_latency*1000:.1f} ms" if last_latency is not None else "-"
-        stdscr.addstr(4, 0, f"Latency: {latency_text}")
-        stdscr.addstr(5, 0, f"Success: {success}  Failure: {failure}")
-        for idx, line in enumerate(log[-10:], start=7):
+        opt = manager.get_stats("OPTIONS")
+        inv = manager.get_stats("INVITE")
+        stdscr.addstr(3, 0, (
+            f"OPTIONS: sent {opt['sent']} 200OK {opt['ok']} timeout {opt['timeout']} "
+            f"success {opt['success_rate']*100:.1f}% avg {opt['avg_latency']*1000:.1f}ms"
+        ))
+        stdscr.addstr(4, 0, (
+            f"INVITE: sent {inv['sent']} 200OK {inv['ok']} timeout {inv['timeout']} "
+            f"success {inv['success_rate']*100:.1f}% avg {inv['avg_latency']*1000:.1f}ms"
+        ))
+        for idx, line in enumerate(log[-10:], start=6):
             stdscr.addstr(idx, 0, line)
         stdscr.refresh()
 
         now = time.time()
         if monitoring and now >= next_time:
-            ok, latency, _, _ = app.send_options(host, port)
-            last_ok = ok
-            last_latency = latency
+            resp, latency = manager.send_request("OPTIONS")
+            ok = resp is not None and resp.get("status") == 200
             msg = f"OPTIONS {'OK' if ok else 'FAIL'} {latency*1000:.1f}ms"
             log.append(msg)
-            if ok:
-                success += 1
-            else:
-                failure += 1
             next_time = now + interval
 
         c = stdscr.getch()
@@ -61,8 +55,11 @@ def monitor(stdscr, host="127.0.0.1", port=5060, interval=5):
             stdscr.addstr(18, 0, "Headers (key:value;...): ")
             headers_line = stdscr.getstr(18, 26).decode()
             curses.noecho()
-            headers = "".join(f"{h.strip()}\r\n" for h in headers_line.split(';') if h.strip())
-            ok, latency, _, _ = app.send_invite(host, port, headers=headers)
+            headers = "".join(
+                f"{h.strip()}\r\n" for h in headers_line.split(';') if h.strip()
+            )
+            resp, latency = manager.send_request("INVITE", headers=headers)
+            ok = resp is not None and resp.get("status") == 200
             msg = f"INVITE {'OK' if ok else 'FAIL'} {latency*1000:.1f}ms"
             log.append(msg)
         time.sleep(0.1)

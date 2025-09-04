@@ -32,6 +32,10 @@ class SIPManager:
         self.src_ip = src_ip
         self.src_port = src_port
         self.user = user
+        self.stats = {
+            "OPTIONS": {"sent": 0, "ok": 0, "timeout": 0, "latencies": []},
+            "INVITE": {"sent": 0, "ok": 0, "timeout": 0, "latencies": []},
+        }
 
     def _new_call(self):
         call_id = str(uuid.uuid4())
@@ -53,7 +57,9 @@ class SIPManager:
         )
         return msg
 
-    def build_invite(self):
+    def build_invite(self, headers=""):
+        if headers and not headers.endswith("\r\n"):
+            headers += "\r\n"
         call_id, branch = self._new_call()
         msg = (
             f"INVITE sip:{self.remote_ip} SIP/2.0\r\n"
@@ -63,13 +69,14 @@ class SIPManager:
             f"To: <sip:{self.remote_ip}>\r\n"
             f"Call-ID: {call_id}\r\n"
             f"CSeq: 1 INVITE\r\n"
+            f"{headers}"
             f"Contact: <sip:{self.user}@{self.src_ip}:{self.src_port}>\r\n"
             f"Content-Type: application/sdp\r\n"
             f"Content-Length: 0\r\n\r\n"
         )
         return msg
 
-    def send_request(self, method="OPTIONS", repeat=1):
+    def send_request(self, method="OPTIONS", repeat=1, headers=""):
         """Send a SIP request and parse the response.
 
         Parameters
@@ -78,18 +85,23 @@ class SIPManager:
             Method to send ("OPTIONS" or "INVITE").
         repeat : int or None
             Number of times to send the request. ``None`` sends forever.
+        headers : str
+            Additional headers for INVITE requests.
 
         Returns
         -------
-        dict or None
-            Parsed response information or ``None`` on timeout.
+        tuple
+            A tuple ``(response, latency)`` where ``response`` is a dict with
+            parsed information or ``None`` on timeout, and ``latency`` is the
+            elapsed time in seconds for the last request.
         """
         method = method.upper()
-        builder = self.build_options if method == "OPTIONS" else self.build_invite
+        builder = self.build_options if method == "OPTIONS" else lambda: self.build_invite(headers)
         last_response = None
         count = repeat
         while True:
             msg = builder().encode()
+            start = time.time()
             logger.info("Enviando %s a %s:%s", method, self.remote_ip, self.remote_port)
             logger.debug("Mensaje enviado: %s", msg.decode(errors="ignore"))
             if self.protocol == "TCP":
@@ -131,6 +143,10 @@ class SIPManager:
                 finally:
                     sock.close()
 
+            latency = time.time() - start
+            stats = self.stats[method]
+            stats["sent"] += 1
+            stats["latencies"].append(latency)
             if data:
                 text = data.decode(errors="ignore")
                 first_line = text.splitlines()[0] if text else ""
@@ -138,8 +154,11 @@ class SIPManager:
                 status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
                 reason = parts[2] if len(parts) > 2 else ""
                 last_response = {"status": status, "reason": reason, "raw": text, "from": addr}
+                if status == 200:
+                    stats["ok"] += 1
             else:
                 last_response = None
+                stats["timeout"] += 1
 
             if count is None:
                 time.sleep(self.interval)
@@ -148,4 +167,21 @@ class SIPManager:
             if count <= 0:
                 break
             time.sleep(self.interval)
-        return last_response
+        return last_response, latency
+
+    def get_stats(self, method):
+        method = method.upper()
+        stats = self.stats.get(method, {})
+        sent = stats.get("sent", 0)
+        ok = stats.get("ok", 0)
+        timeout = stats.get("timeout", 0)
+        success_rate = ok / sent if sent else 0.0
+        latencies = stats.get("latencies", [])
+        avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
+        return {
+            "sent": sent,
+            "ok": ok,
+            "timeout": timeout,
+            "success_rate": success_rate,
+            "avg_latency": avg_latency,
+        }
