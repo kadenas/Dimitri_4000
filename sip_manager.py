@@ -6,7 +6,7 @@ import uuid
 logger = logging.getLogger("socket_handler")
 
 
-def _status_from_response(data: bytes):
+def status_from_response(data: bytes):
     """Devuelve (codigo, razon) a partir de la primera línea SIP."""
     try:
         line0 = data.decode(errors="ignore").splitlines()[0]
@@ -18,7 +18,10 @@ def _status_from_response(data: bytes):
         return None, ""
 
 
-def _build_options(dst_host: str, local_ip: str, local_port: int, user: str, cseq: int) -> bytes:
+def build_options(
+    dst_host: str, local_ip: str, local_port: int, user: str, cseq: int
+) -> tuple[str, bytes]:
+    """Construye un mensaje OPTIONS y devuelve (call-id, bytes)."""
     call_id = str(uuid.uuid4())
     branch = "z9hG4bK" + call_id.replace("-", "")
     sent_by = f"{local_ip}:{local_port}"  # SIEMPRE con puerto real
@@ -36,7 +39,25 @@ def _build_options(dst_host: str, local_ip: str, local_port: int, user: str, cse
         f"Accept: application/sdp\r\n"
         f"Content-Length: 0\r\n\r\n"
     )
-    return msg.encode()
+    return call_id, msg.encode()
+
+
+def parse_headers(data: bytes):
+    """Parsea cabeceras SIP mínimas y devuelve (start_line, dict)."""
+    try:
+        text = data.decode(errors="ignore")
+    except Exception:
+        return "", {}
+    lines = text.split("\r\n")
+    start = lines[0] if lines else ""
+    headers = {}
+    for line in lines[1:]:
+        if not line:
+            break
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+    return start, headers
 
 
 class SIPManager:
@@ -86,7 +107,7 @@ class SIPManager:
 
         s.settimeout(timeout)
 
-        payload = _build_options(dst_host, local_ip, local_port, user, cseq)
+        _call_id, payload = build_options(dst_host, local_ip, local_port, user, cseq)
 
         t0 = time.time()
         logger.info(
@@ -97,7 +118,7 @@ class SIPManager:
             data = s.recv(2048)
             rtt_ms = int((time.time() - t0) * 1000)
             logger.info(f"UDP recibido de {dst_host}:{dst_port}")
-            code, reason = _status_from_response(data)
+            code, reason = status_from_response(data)
             return code, reason, rtt_ms
         except socket.timeout:
             return None, None, None

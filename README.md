@@ -130,6 +130,24 @@ Para usar un puerto alternativo:
 python app.py -c config.yaml -n local --port 5070
 ```
 
+### Modo servicio y respuesta a OPTIONS
+
+Para mantener el proceso activo enviando OPTIONS periódicos y respondiendo a
+peticiones entrantes, utiliza `--service` junto con `--reply-options`. Si se
+encuentra detrás de NAT, asegúrate de exponer `--src-port 5060`.
+
+Ejemplo 1: “faro” completo:
+
+```bash
+python app.py --service --reply-options --src-port 5060 --dst 10.1.72.188 --dst-port 5060 --interval 1 --cseq-start 1
+```
+
+Ejemplo 2: solo responder:
+
+```bash
+python app.py --service --reply-options --src-port 5060
+```
+
 ### Interfaz interactiva
 
 ```bash
