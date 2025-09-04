@@ -69,26 +69,71 @@ class SIPManager:
         )
         return msg
 
-    def build_invite(self, headers=""):
-        if headers and not headers.endswith("\r\n"):
-            headers += "\r\n"
-        call_id, branch = self._new_call()
-        msg = (
-            f"INVITE sip:{self.remote_ip} SIP/2.0\r\n"
-            f"Via: SIP/2.0/{self.protocol} {self.src_ip}:{self.src_port};branch={branch}\r\n"
-            f"Max-Forwards: 70\r\n"
-            f"From: <sip:{self.user}@{self.src_ip}>;tag={self.user}\r\n"
-            f"To: <sip:{self.remote_ip}>\r\n"
-            f"Call-ID: {call_id}\r\n"
-            f"CSeq: 1 INVITE\r\n"
-            f"{headers}"
-            f"Contact: <sip:{self.user}@{self.src_ip}:{self.src_port}>\r\n"
-            f"Content-Type: application/sdp\r\n"
-            f"Content-Length: 0\r\n\r\n"
-        )
-        return msg
+    def build_invite(self, headers=None):
+        """Build an INVITE request.
 
-    def send_request(self, method="OPTIONS", repeat=1, headers="", retries=None):
+        Parameters
+        ----------
+        headers : dict or str, optional
+            Custom headers to include or override. When a string is provided it
+            should contain ``Header: value`` lines separated by newlines.
+
+        Returns
+        -------
+        str
+            Complete SIP INVITE message.
+
+        Raises
+        ------
+        ValueError
+            If any mandatory header is missing.
+        """
+        call_id, branch = self._new_call()
+        base_headers = {
+            "Via": f"SIP/2.0/{self.protocol} {self.src_ip}:{self.src_port};branch={branch}",
+            "Max-Forwards": "70",
+            "From": f"<sip:{self.user}@{self.src_ip}>;tag={self.user}",
+            "To": f"<sip:{self.remote_ip}>",
+            "Call-ID": call_id,
+            "CSeq": "1 INVITE",
+            "Contact": f"<sip:{self.user}@{self.src_ip}:{self.src_port}>",
+            "Content-Type": "application/sdp",
+            "Content-Length": "0",
+        }
+
+        custom = {}
+        if headers:
+            if isinstance(headers, str):
+                lines = [line.strip() for line in headers.splitlines() if line.strip()]
+                for line in lines:
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        custom[k.strip()] = v.strip()
+            elif isinstance(headers, dict):
+                custom = {k.strip(): v for k, v in headers.items()}
+
+        # Override defaults and add any additional headers
+        base_headers.update(custom)
+
+        mandatory = [
+            "Via",
+            "From",
+            "To",
+            "Call-ID",
+            "CSeq",
+            "Max-Forwards",
+            "Contact",
+            "Content-Length",
+        ]
+        for hdr in mandatory:
+            if not base_headers.get(hdr):
+                raise ValueError(f"Missing mandatory header: {hdr}")
+
+        start_line = f"INVITE sip:{self.remote_ip} SIP/2.0\r\n"
+        header_lines = "".join(f"{k}: {v}\r\n" for k, v in base_headers.items())
+        return start_line + header_lines + "\r\n"
+
+    def send_request(self, method="OPTIONS", repeat=1, headers=None, retries=None):
         """Send a SIP request and parse the response.
 
         Parameters
@@ -97,8 +142,9 @@ class SIPManager:
             Method to send ("OPTIONS" or "INVITE").
         repeat : int or None
             Number of times to send the request. ``None`` sends forever.
-        headers : str
-            Additional headers for INVITE requests.
+        headers : dict or str, optional
+            Additional headers for INVITE requests. Can override default
+            headers when provided.
         retries : int or None
             Number of times to retry on timeout or network error for each
             request. ``None`` uses the value configured on the instance.

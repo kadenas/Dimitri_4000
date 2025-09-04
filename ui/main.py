@@ -52,12 +52,23 @@ def monitor(stdscr, host="127.0.0.1", port=5060, interval=5):
                 next_time = 0
         elif c == ord('i'):
             curses.echo()
-            stdscr.addstr(18, 0, "Headers (key:value;...): ")
-            headers_line = stdscr.getstr(18, 26).decode()
+            stdscr.addstr(18, 0, "Headers (key:value;... or @file): ")
+            headers_line = stdscr.getstr(18, 36).decode()
             curses.noecho()
-            headers = "".join(
-                f"{h.strip()}\r\n" for h in headers_line.split(';') if h.strip()
-            )
+            headers_input = headers_line.strip()
+            if headers_input.startswith('@'):
+                path = headers_input[1:]
+                try:
+                    with open(path) as f:
+                        headers = f.read()
+                except OSError as exc:
+                    log.append(f"Error reading {path}: {exc}")
+                    time.sleep(0.5)
+                    continue
+            else:
+                headers = "".join(
+                    f"{h.strip()}\r\n" for h in headers_input.split(';') if h.strip()
+                )
             resp, latency = manager.send_request("INVITE", headers=headers)
             ok = resp is not None and resp.get("status") == 200
             msg = f"INVITE {'OK' if ok else 'FAIL'} {latency*1000:.1f}ms"
