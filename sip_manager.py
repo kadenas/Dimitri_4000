@@ -1,6 +1,13 @@
 import socket
 import uuid
 import time
+import logging
+
+from logging_conf import setup_logging
+
+
+setup_logging()
+logger = logging.getLogger(__name__)
 
 
 class SIPManager:
@@ -83,6 +90,8 @@ class SIPManager:
         count = repeat
         while True:
             msg = builder().encode()
+            logger.info("Enviando %s a %s:%s", method, self.remote_ip, self.remote_port)
+            logger.debug("Mensaje enviado: %s", msg.decode(errors="ignore"))
             if self.protocol == "TCP":
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(self.timeout)
@@ -91,9 +100,16 @@ class SIPManager:
                     sock.sendall(msg)
                     data = sock.recv(4096)
                     addr = (self.remote_ip, self.remote_port)
+                    logger.info("Respuesta TCP de %s:%s", addr[0], addr[1])
+                    logger.debug("Mensaje recibido: %s", data.decode(errors="ignore"))
                 except socket.timeout:
                     data = b""
                     addr = (self.remote_ip, self.remote_port)
+                    logger.error("Timeout esperando respuesta TCP de %s:%s", self.remote_ip, self.remote_port)
+                except OSError as exc:
+                    data = b""
+                    addr = (self.remote_ip, self.remote_port)
+                    logger.error("Error de red TCP: %s", exc)
                 finally:
                     sock.close()
             else:
@@ -102,9 +118,16 @@ class SIPManager:
                 try:
                     sock.sendto(msg, (self.remote_ip, self.remote_port))
                     data, addr = sock.recvfrom(4096)
+                    logger.info("Respuesta UDP de %s:%s", addr[0], addr[1])
+                    logger.debug("Mensaje recibido: %s", data.decode(errors="ignore"))
                 except socket.timeout:
                     data = b""
                     addr = (self.remote_ip, self.remote_port)
+                    logger.error("Timeout esperando respuesta UDP de %s:%s", self.remote_ip, self.remote_port)
+                except OSError as exc:
+                    data = b""
+                    addr = (self.remote_ip, self.remote_port)
+                    logger.error("Error de red UDP: %s", exc)
                 finally:
                     sock.close()
 
