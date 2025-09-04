@@ -1,4 +1,10 @@
 import socket, sys, uuid, time
+import logging
+
+from logging_conf import setup_logging
+
+
+logger = setup_logging()
 
 def build_options(dst_host, dst_port, src_host="127.0.0.1", user="dimitri"):
     call_id = str(uuid.uuid4())
@@ -20,13 +26,23 @@ def send_options(dst_host, dst_port=5060, timeout=2):
     s.settimeout(timeout)
     s.bind(("0.0.0.0", 5060))
     start = time.time()
-    s.sendto(build_options(dst_host, dst_port), (dst_host, dst_port))
+    msg = build_options(dst_host, dst_port)
+    logger.info("Enviando OPTIONS a %s:%s", dst_host, dst_port)
+    logger.debug("Mensaje enviado: %s", msg.decode(errors="ignore"))
+    s.sendto(msg, (dst_host, dst_port))
     try:
         data, addr = s.recvfrom(2048)
         latency = time.time() - start
+        logger.info("Respuesta de %s:%s", addr[0], addr[1])
+        logger.debug("Mensaje recibido: %s", data.decode(errors="ignore"))
         return True, latency, addr, data.decode(errors="ignore")
     except socket.timeout:
         latency = time.time() - start
+        logger.error("Timeout esperando respuesta de %s:%s", dst_host, dst_port)
+        return False, latency, None, ""
+    except OSError as exc:
+        latency = time.time() - start
+        logger.error("Error de red enviando OPTIONS: %s", exc)
         return False, latency, None, ""
     finally:
         s.close()
@@ -57,13 +73,23 @@ def send_invite(dst_host, dst_port=5060, timeout=2, headers=""):
     s.settimeout(timeout)
     s.bind(("0.0.0.0", 5060))
     start = time.time()
-    s.sendto(build_invite(dst_host, dst_port, headers=headers), (dst_host, dst_port))
+    msg = build_invite(dst_host, dst_port, headers=headers)
+    logger.info("Enviando INVITE a %s:%s", dst_host, dst_port)
+    logger.debug("Mensaje enviado: %s", msg.decode(errors="ignore"))
+    s.sendto(msg, (dst_host, dst_port))
     try:
         data, addr = s.recvfrom(2048)
         latency = time.time() - start
+        logger.info("Respuesta de %s:%s", addr[0], addr[1])
+        logger.debug("Mensaje recibido: %s", data.decode(errors="ignore"))
         return True, latency, addr, data.decode(errors="ignore")
     except socket.timeout:
         latency = time.time() - start
+        logger.error("Timeout esperando respuesta de %s:%s", dst_host, dst_port)
+        return False, latency, None, ""
+    except OSError as exc:
+        latency = time.time() - start
+        logger.error("Error de red enviando INVITE: %s", exc)
         return False, latency, None, ""
     finally:
         s.close()
@@ -72,6 +98,8 @@ if __name__ == "__main__":
     port = int(sys.argv[2]) if len(sys.argv) > 2 else 5060
     ok, latency, addr, data = send_options(host, port)
     if ok:
+        logger.info("Respuesta de %s:%s", addr[0], addr[1])
         print("Respuesta de", addr, "\n", data)
     else:
+        logger.error("Timeout esperando respuesta de %s:%s", host, port)
         print("Timeout esperando respuesta")
