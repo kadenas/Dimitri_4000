@@ -38,6 +38,12 @@ def parse_args():
     p.add_argument("--timeout", type=float, default=2.0, help="Timeout de socket (s)")
     p.add_argument("--count", type=int, default=1, help="Número de OPTIONS a enviar")
     p.add_argument("--bind-ip", default=None, help="IP local desde la que salir (opcional)")
+    p.add_argument(
+        "--src-port",
+        type=int,
+        default=0,
+        help="Puerto UDP de origen (0 = efímero)",
+    )
     p.add_argument("--cseq-start", type=int, default=1, help="CSeq inicial (por defecto 1)")
     # Compatibilidad con la CLI antigua: host [port]
     p.add_argument("host", nargs="?", help="Destino (compat)")
@@ -63,13 +69,18 @@ def main():
     for i in range(args.count):
         cseq = args.cseq_start + i
         logger.info(f"Enviando OPTIONS (CSeq={cseq}) a {dst}:{dport}")
-        code, reason, rtt_ms = sm.send_request(
-            dst_host=dst,
-            dst_port=dport,
-            timeout=args.timeout,
-            bind_ip=args.bind_ip,
-            cseq=cseq,
-        )
+        try:
+            code, reason, rtt_ms = sm.send_request(
+                dst_host=dst,
+                dst_port=dport,
+                timeout=args.timeout,
+                bind_ip=args.bind_ip,
+                bind_port=args.src_port,
+                cseq=cseq,
+            )
+        except OSError as e:
+            logger.error(f"No se pudo abrir socket UDP en puerto {args.src_port}: {e}")
+            raise SystemExit(1)
 
         ts = datetime.now(UTC).isoformat()
         if code is None:
