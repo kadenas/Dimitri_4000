@@ -1,7 +1,10 @@
 import socket, sys, uuid, time
 import logging
+import argparse
 
 from logging_conf import setup_logging
+from config import load_config
+from sip_manager import SIPManager
 
 
 logger = setup_logging()
@@ -94,12 +97,32 @@ def send_invite(dst_host, dst_port=5060, timeout=2, headers=""):
     finally:
         s.close()
 if __name__ == "__main__":
-    host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
-    port = int(sys.argv[2]) if len(sys.argv) > 2 else 5060
-    ok, latency, addr, data = send_options(host, port)
-    if ok:
-        logger.info("Respuesta de %s:%s", addr[0], addr[1])
-        print("Respuesta de", addr, "\n", data)
+    parser = argparse.ArgumentParser(description="Envía mensajes SIP OPTIONS")
+    parser.add_argument("host", nargs="?", help="Host remoto si no se usa config")
+    parser.add_argument("port", nargs="?", type=int, help="Puerto remoto", default=5060)
+    parser.add_argument("-c", "--config", help="Archivo de configuración")
+    parser.add_argument("-n", "--name", help="Nombre del destino en la config")
+    parser.add_argument("--port", dest="override_port", type=int, help="Puerto alternativo")
+    parser.add_argument("--count", type=int, default=1, help="Número de OPTIONS a enviar (0=infinito)")
+    args = parser.parse_args()
+
+    if args.config and args.name:
+        destinations = load_config(args.config)
+        if args.name not in destinations:
+            parser.error(f"Destino {args.name} no encontrado en config")
+        dst = destinations[args.name]
+        if args.override_port is not None:
+            dst.port = args.override_port
+        manager = SIPManager(dst.ip, dst.port, protocol=dst.protocol, interval=dst.interval)
+        repeat = None if args.count == 0 else args.count
+        manager.send_request("OPTIONS", repeat=repeat)
     else:
-        logger.error("Timeout esperando respuesta de %s:%s", host, port)
-        print("Timeout esperando respuesta")
+        host = args.host if args.host else "127.0.0.1"
+        port = args.override_port if args.override_port is not None else args.port
+        ok, latency, addr, data = send_options(host, port)
+        if ok:
+            logger.info("Respuesta de %s:%s", addr[0], addr[1])
+            print("Respuesta de", addr, "\n", data)
+        else:
+            logger.error("Timeout esperando respuesta de %s:%s", host, port)
+            print("Timeout esperando respuesta")

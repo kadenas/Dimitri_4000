@@ -12,6 +12,31 @@ pruebas de latencia y observar el estado de la conexión.
 python app.py <host> [puerto]
 ```
 
+### Usar archivo de configuración
+
+Define destinos en `config.yaml` (JSON válido):
+
+```yaml
+{
+  "destinations": {
+    "local": {"ip": "127.0.0.1", "port": 5060, "protocol": "UDP", "interval": 5},
+    "backup": {"ip": "192.0.2.10", "port": 5080, "protocol": "TCP", "interval": 10}
+  }
+}
+```
+
+Selecciona un destino y envía OPTIONS periódicos:
+
+```bash
+python app.py -c config.yaml -n local --count 0
+```
+
+Para usar un puerto alternativo:
+
+```bash
+python app.py -c config.yaml -n local --port 5070
+```
+
 ### Interfaz interactiva
 
 ```bash
