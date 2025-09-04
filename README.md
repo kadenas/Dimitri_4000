@@ -47,14 +47,20 @@ siguientes campos:
 ### Parámetros de ejecución
 
 ```
-python app.py <host> [puerto]
+python app.py [host] [puerto]
+python app.py --dst <host> --dst-port <puerto> --protocol udp --count 1
 ```
 
 Opciones principales:
 
 - `-c/--config`: ruta al archivo de configuración.
 - `-n/--name`: nombre del destino dentro del archivo de configuración.
-- `--port`: puerto alternativo para el destino seleccionado.
+- `--dst`: host destino (alternativa a los posicionales).
+- `--dst-port`: puerto destino (por defecto 5060).
+- `--protocol`: `udp` o `tcp` (TCP no implementado).
+- `--interval`: segundos entre envíos.
+- `--timeout`: tiempo de espera de respuesta.
+- `--bind-ip`: IP de origen (opcional).
 - `--count`: número de OPTIONS a enviar (`0` para infinito).
 
 ## Ejemplos
@@ -62,8 +68,20 @@ Opciones principales:
 ### Prueba rápida de OPTIONS
 
 ```bash
-python app.py <host> [puerto]
+python app.py 10.1.72.188 5060 --count 2
 ```
+El log muestra el puerto efímero real desde el que se envía, por ejemplo:
+
+```
+2024-03-05 12:00:00,000 - sip_manager - INFO - Enviando OPTIONS a 10.1.72.188:5060 sent-by=10.1.64.18:53123
+```
+
+### Ejemplo con flags modernos
+
+```bash
+python app.py --dst 10.1.72.188 --dst-port 5060 --protocol udp --count 2 --interval 0.5 --timeout 2
+```
+El comando anterior crea/actualiza `dimitri_stats.csv` con las métricas.
 
 ### Usar archivo de configuración
 

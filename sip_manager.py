@@ -19,6 +19,18 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 
+def detect_src_ip(dst_host, dst_port):
+    """Detect the outgoing source IP for the given destination."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((dst_host, dst_port))
+        return s.getsockname()[0]
+    except OSError:
+        return "0.0.0.0"
+    finally:
+        s.close()
+
+
 class SIPManager:
     """Utility to build and send simple SIP requests."""
 
@@ -31,7 +43,7 @@ class SIPManager:
         timeout=2,
         retries=3,
         src_ip="0.0.0.0",
-        src_port=5060,
+        src_port=0,
         user="dimitri",
     ):
         ipaddress.ip_address(remote_ip)
@@ -41,33 +53,74 @@ class SIPManager:
         self.interval = interval
         self.timeout = timeout
         self.retries = retries
-        self.src_ip = src_ip
+        self.src_ip = src_ip or "0.0.0.0"
         self.src_port = src_port
         self.user = user
         self.stats = {
             "OPTIONS": {"sent": 0, "ok": 0, "timeout": 0, "latencies": []},
             "INVITE": {"sent": 0, "ok": 0, "timeout": 0, "latencies": []},
         }
+        if self.src_ip in ("0.0.0.0", ""):
+            self.src_ip = detect_src_ip(self.remote_ip, self.remote_port)
 
     def _new_call(self):
         call_id = str(uuid.uuid4())
         branch = "z9hG4bK" + call_id.replace("-", "")
         return call_id, branch
 
-    def build_options(self):
+    def build_options(self, src_ip=None, src_port=0):
+        src_ip = src_ip or self.src_ip
         call_id, branch = self._new_call()
         msg = (
             f"OPTIONS sip:{self.remote_ip} SIP/2.0\r\n"
-            f"Via: SIP/2.0/{self.protocol} {self.src_ip}:{self.src_port};branch={branch}\r\n"
-            f"Max-Forwards: 70\r\n"
-            f"From: <sip:{self.user}@{self.src_ip}>;tag={self.user}\r\n"
+            f"Via: SIP/2.0/UDP {src_ip}:{src_port};branch={branch};rport\r\n"
+            "Max-Forwards: 70\r\n"
+            f"From: <sip:{self.user}@{src_ip}>;tag={self.user}\r\n"
             f"To: <sip:{self.remote_ip}>\r\n"
             f"Call-ID: {call_id}\r\n"
-            f"CSeq: 1 OPTIONS\r\n"
-            f"Contact: <sip:{self.user}@{self.src_ip}:{self.src_port}>\r\n"
-            f"Content-Length: 0\r\n\r\n"
+            "CSeq: 1 OPTIONS\r\n"
+            f"Contact: <sip:{self.user}@{src_ip}>\r\n"
+            "User-Agent: Dimitri-4000/0.1\r\n"
+            "Allow: INVITE, ACK, CANCEL, OPTIONS, BYE\r\n"
+            "Accept: application/sdp\r\n"
+            "Content-Length: 0\r\n\r\n"
         )
         return msg
+
+    def send_options(self):
+        if self.protocol != "UDP":
+            raise NotImplementedError("TCP no implementado")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        bind_ip = self.src_ip if self.src_ip not in ("0.0.0.0", "") else "0.0.0.0"
+        start = time.time()
+        try:
+            if self.timeout is not None:
+                sock.settimeout(self.timeout)
+            sock.bind((bind_ip, 0))
+            sock.connect((self.remote_ip, self.remote_port))
+            local_ip, local_port = sock.getsockname()
+            msg = self.build_options(local_ip, local_port).encode()
+            logger.info(
+                "Enviando OPTIONS a %s:%s sent-by=%s:%s",
+                self.remote_ip,
+                self.remote_port,
+                local_ip,
+                local_port,
+            )
+            sock.send(msg)
+            data = sock.recv(2048)
+            rtt = (time.time() - start) * 1000
+            text = data.decode(errors="ignore")
+            first = text.splitlines()[0] if text else ""
+            parts = first.split(" ", 2)
+            status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+            reason = parts[2] if len(parts) > 2 else ""
+            return status, reason, rtt, text
+        except (socket.timeout, OSError):
+            rtt = (time.time() - start) * 1000
+            return None, "", rtt, ""
+        finally:
+            sock.close()
 
     def build_invite(self, headers=None):
         """Build an INVITE request.
