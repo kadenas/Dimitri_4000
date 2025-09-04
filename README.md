@@ -61,6 +61,7 @@ Opciones principales:
 - `--interval`: segundos entre envíos.
 - `--timeout`: tiempo de espera de respuesta.
 - `--bind-ip`: IP de origen (opcional).
+- `--src-port`: puerto UDP de origen (0 para efímero).
 - `--count`: número de OPTIONS a enviar (`0` para infinito).
 
 ## Ejemplos
@@ -74,6 +75,12 @@ El log muestra el puerto efímero real desde el que se envía, por ejemplo:
 
 ```
 2024-03-05 12:00:00,000 - sip_manager - INFO - Enviando OPTIONS a 10.1.72.188:5060 sent-by=10.1.64.18:53123
+```
+
+Para fijar el puerto de origen:
+
+```bash
+python app.py 10.1.72.188 5060 --src-port 5062
 ```
 
 ### Ejemplo con flags modernos

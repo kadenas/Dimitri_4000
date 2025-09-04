@@ -43,14 +43,23 @@ class SIPManager:
     def __init__(self, protocol: str = "udp"):
         self.protocol = protocol
 
-    def _open_connected_udp(self, dst_host: str, dst_port: int, bind_ip: str | None):
+    def _open_connected_udp(
+        self,
+        dst_host: str,
+        dst_port: int,
+        bind_ip: str | None,
+        bind_port: int,
+    ):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Bindea a IP local (si se indica) o 0.0.0.0 con puerto efímero
-        s.bind(((bind_ip or "0.0.0.0"), 0))
-        # Conecta para fijar local_ip:local_port reales
-        s.connect((dst_host, dst_port))
-        local_ip, local_port = s.getsockname()
-        return s, local_ip, local_port
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(((bind_ip or "0.0.0.0"), bind_port or 0))
+            s.connect((dst_host, dst_port))
+            local_ip, local_port = s.getsockname()
+            return s, local_ip, local_port
+        except OSError:
+            s.close()
+            raise
 
     def send_request(
         self,
@@ -58,21 +67,32 @@ class SIPManager:
         dst_port: int = 5060,
         timeout: float = 2.0,
         bind_ip: str | None = None,
+        bind_port: int = 0,
         cseq: int = 1,
         user: str = "dimitri",
     ):
         if self.protocol != "udp":
             raise NotImplementedError("Solo UDP por ahora.")
 
-        s, local_ip, local_port = self._open_connected_udp(dst_host, dst_port, bind_ip)
+        try:
+            s, local_ip, local_port = self._open_connected_udp(
+                dst_host, dst_port, bind_ip, bind_port
+            )
+        except OSError as e:
+            logger.error(
+                f"No se pudo bindear UDP en {bind_ip or '0.0.0.0'}:{bind_port}: {e}"
+            )
+            raise
+
         s.settimeout(timeout)
 
         payload = _build_options(dst_host, local_ip, local_port, user, cseq)
 
         t0 = time.time()
-        logger.info(f"Abriendo socket UDP a {dst_host}:{dst_port}")
+        logger.info(
+            f"Enviando UDP a {dst_host}:{dst_port} sent-by={local_ip}:{local_port}"
+        )
         s.send(payload)
-        logger.info(f"UDP enviado a {dst_host}:{dst_port} sent-by={local_ip}:{local_port}")
         try:
             data = s.recv(2048)
             rtt_ms = int((time.time() - t0) * 1000)
