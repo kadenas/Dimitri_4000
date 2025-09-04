@@ -69,7 +69,10 @@ def monitor(stdscr, host="127.0.0.1", port=5060, interval=5):
 
 
 def main():
-    curses.wrapper(monitor)
+    import sys
+    host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 5060
+    curses.wrapper(lambda stdscr: monitor(stdscr, host, port))
 
 
 if __name__ == "__main__":
