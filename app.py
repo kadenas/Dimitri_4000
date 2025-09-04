@@ -113,7 +113,14 @@ if __name__ == "__main__":
         dst = destinations[args.name]
         if args.override_port is not None:
             dst.port = args.override_port
-        manager = SIPManager(dst.ip, dst.port, protocol=dst.protocol, interval=dst.interval)
+        manager = SIPManager(
+            dst.ip,
+            dst.port,
+            protocol=dst.protocol,
+            interval=dst.interval,
+            timeout=dst.timeout,
+            retries=dst.retries,
+        )
         repeat = None if args.count == 0 else args.count
         manager.send_request("OPTIONS", repeat=repeat)
     else:

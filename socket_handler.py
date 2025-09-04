@@ -1,6 +1,7 @@
 import socket
 import ipaddress
 import logging
+import signal
 from contextlib import contextmanager
 from typing import Generator, Tuple
 
@@ -19,6 +20,17 @@ def _validate_ip(ip: str) -> None:
         raise ValueError(f"IP inválida: {ip}") from exc
 
 
+def _socket_signal_handler(sock: socket.socket, proto: str):
+    def handler(signum, frame):
+        logger.info("Señal %s recibida, cerrando socket %s", signum, proto)
+        try:
+            sock.close()
+        finally:
+            raise SystemExit(0)
+
+    return handler
+
+
 @contextmanager
 def open_udp_socket(
     remote_ip: str,
@@ -35,6 +47,9 @@ def open_udp_socket(
     _validate_ip(remote_ip)
     logger.info("Abriendo socket UDP a %s:%s", remote_ip, remote_port)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    handler = _socket_signal_handler(sock, "UDP")
+    old_int = signal.signal(signal.SIGINT, handler)
+    old_term = signal.signal(signal.SIGTERM, handler)
     try:
         if timeout is not None:
             sock.settimeout(timeout)
@@ -45,6 +60,8 @@ def open_udp_socket(
         raise
     finally:
         sock.close()
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
         logger.info("Socket UDP cerrado")
 
 
@@ -87,6 +104,9 @@ def open_tcp_socket(
     _validate_ip(remote_ip)
     logger.info("Abriendo socket TCP a %s:%s", remote_ip, remote_port)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    handler = _socket_signal_handler(sock, "TCP")
+    old_int = signal.signal(signal.SIGINT, handler)
+    old_term = signal.signal(signal.SIGTERM, handler)
     try:
         if timeout is not None:
             sock.settimeout(timeout)
@@ -98,6 +118,8 @@ def open_tcp_socket(
         raise
     finally:
         sock.close()
+        signal.signal(signal.SIGINT, old_int)
+        signal.signal(signal.SIGTERM, old_term)
         logger.info("Socket TCP cerrado")
 
 

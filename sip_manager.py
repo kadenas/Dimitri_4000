@@ -2,7 +2,16 @@ import socket
 import uuid
 import time
 import logging
+import ipaddress
 
+from socket_handler import (
+    open_udp_socket,
+    open_tcp_socket,
+    udp_send,
+    udp_receive,
+    tcp_send,
+    tcp_receive,
+)
 from logging_conf import setup_logging
 
 
@@ -20,15 +29,18 @@ class SIPManager:
         protocol="UDP",
         interval=60,
         timeout=2,
+        retries=3,
         src_ip="0.0.0.0",
         src_port=5060,
         user="dimitri",
     ):
+        ipaddress.ip_address(remote_ip)
         self.remote_ip = remote_ip
         self.remote_port = remote_port
         self.protocol = protocol.upper()
         self.interval = interval
         self.timeout = timeout
+        self.retries = retries
         self.src_ip = src_ip
         self.src_port = src_port
         self.user = user
@@ -76,7 +88,7 @@ class SIPManager:
         )
         return msg
 
-    def send_request(self, method="OPTIONS", repeat=1, headers=""):
+    def send_request(self, method="OPTIONS", repeat=1, headers="", retries=None):
         """Send a SIP request and parse the response.
 
         Parameters
@@ -87,6 +99,9 @@ class SIPManager:
             Number of times to send the request. ``None`` sends forever.
         headers : str
             Additional headers for INVITE requests.
+        retries : int or None
+            Number of times to retry on timeout or network error for each
+            request. ``None`` uses the value configured on the instance.
 
         Returns
         -------
@@ -99,50 +114,56 @@ class SIPManager:
         builder = self.build_options if method == "OPTIONS" else lambda: self.build_invite(headers)
         last_response = None
         count = repeat
+        retries = self.retries if retries is None else retries
         while True:
             msg = builder().encode()
-            start = time.time()
             logger.info("Enviando %s a %s:%s", method, self.remote_ip, self.remote_port)
             logger.debug("Mensaje enviado: %s", msg.decode(errors="ignore"))
-            if self.protocol == "TCP":
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(self.timeout)
+            attempt = 0
+            data = b""
+            addr = (self.remote_ip, self.remote_port)
+            while attempt <= retries:
+                start = time.time()
                 try:
-                    sock.connect((self.remote_ip, self.remote_port))
-                    sock.sendall(msg)
-                    data = sock.recv(4096)
-                    addr = (self.remote_ip, self.remote_port)
-                    logger.info("Respuesta TCP de %s:%s", addr[0], addr[1])
-                    logger.debug("Mensaje recibido: %s", data.decode(errors="ignore"))
+                    if self.protocol == "TCP":
+                        with open_tcp_socket(
+                            self.remote_ip,
+                            self.remote_port,
+                            local_port=self.src_port,
+                            timeout=self.timeout,
+                        ) as sock:
+                            tcp_send(sock, msg)
+                            data = tcp_receive(sock)
+                            addr = sock.getpeername()
+                    else:
+                        with open_udp_socket(
+                            self.remote_ip,
+                            self.remote_port,
+                            local_port=self.src_port,
+                            timeout=self.timeout,
+                        ) as (sock, raddr):
+                            udp_send(sock, msg, raddr)
+                            data, addr = udp_receive(sock)
+                    break
                 except socket.timeout:
-                    data = b""
-                    addr = (self.remote_ip, self.remote_port)
-                    logger.error("Timeout esperando respuesta TCP de %s:%s", self.remote_ip, self.remote_port)
+                    attempt += 1
+                    logger.error(
+                        "Timeout esperando respuesta %s de %s:%s (intento %s/%s)",
+                        self.protocol,
+                        self.remote_ip,
+                        self.remote_port,
+                        attempt,
+                        retries + 1,
+                    )
                 except OSError as exc:
-                    data = b""
-                    addr = (self.remote_ip, self.remote_port)
-                    logger.error("Error de red TCP: %s", exc)
-                finally:
-                    sock.close()
-            else:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.settimeout(self.timeout)
-                try:
-                    sock.sendto(msg, (self.remote_ip, self.remote_port))
-                    data, addr = sock.recvfrom(4096)
-                    logger.info("Respuesta UDP de %s:%s", addr[0], addr[1])
-                    logger.debug("Mensaje recibido: %s", data.decode(errors="ignore"))
-                except socket.timeout:
-                    data = b""
-                    addr = (self.remote_ip, self.remote_port)
-                    logger.error("Timeout esperando respuesta UDP de %s:%s", self.remote_ip, self.remote_port)
-                except OSError as exc:
-                    data = b""
-                    addr = (self.remote_ip, self.remote_port)
-                    logger.error("Error de red UDP: %s", exc)
-                finally:
-                    sock.close()
-
+                    attempt += 1
+                    logger.error(
+                        "Error de red %s en intento %s/%s: %s",
+                        self.protocol,
+                        attempt,
+                        retries + 1,
+                        exc,
+                    )
             latency = time.time() - start
             stats = self.stats[method]
             stats["sent"] += 1
