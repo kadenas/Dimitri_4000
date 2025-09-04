@@ -83,6 +83,14 @@ python app.py --dst 10.1.72.188 --dst-port 5060 --protocol udp --count 2 --inter
 ```
 El comando anterior crea/actualiza `dimitri_stats.csv` con las métricas.
 
+### CSeq incremental
+
+```bash
+python app.py 10.1.72.188 5060 --count 3 --cseq-start 7
+```
+
+Este comando envía tres OPTIONS con CSeq 7, 8 y 9.
+
 ### Usar archivo de configuración
 
 Define destinos en `config.yaml` (JSON válido):

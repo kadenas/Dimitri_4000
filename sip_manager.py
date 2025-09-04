@@ -68,7 +68,7 @@ class SIPManager:
         branch = "z9hG4bK" + call_id.replace("-", "")
         return call_id, branch
 
-    def build_options(self, src_ip=None, src_port=0):
+    def build_options(self, src_ip=None, src_port=0, cseq=1):
         src_ip = src_ip or self.src_ip
         call_id, branch = self._new_call()
         msg = (
@@ -78,7 +78,7 @@ class SIPManager:
             f"From: <sip:{self.user}@{src_ip}>;tag={self.user}\r\n"
             f"To: <sip:{self.remote_ip}>\r\n"
             f"Call-ID: {call_id}\r\n"
-            "CSeq: 1 OPTIONS\r\n"
+            f"CSeq: {cseq} OPTIONS\r\n"
             f"Contact: <sip:{self.user}@{src_ip}>\r\n"
             "User-Agent: Dimitri-4000/0.1\r\n"
             "Allow: INVITE, ACK, CANCEL, OPTIONS, BYE\r\n"
@@ -87,7 +87,7 @@ class SIPManager:
         )
         return msg
 
-    def send_options(self):
+    def send_options(self, cseq=1):
         if self.protocol != "UDP":
             raise NotImplementedError("TCP no implementado")
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -99,9 +99,10 @@ class SIPManager:
             sock.bind((bind_ip, 0))
             sock.connect((self.remote_ip, self.remote_port))
             local_ip, local_port = sock.getsockname()
-            msg = self.build_options(local_ip, local_port).encode()
+            msg = self.build_options(local_ip, local_port, cseq).encode()
             logger.info(
-                "Enviando OPTIONS a %s:%s sent-by=%s:%s",
+                "Enviando OPTIONS (CSeq=%s) a %s:%s sent-by=%s:%s",
+                cseq,
                 self.remote_ip,
                 self.remote_port,
                 local_ip,

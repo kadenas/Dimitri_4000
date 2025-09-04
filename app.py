@@ -116,16 +116,17 @@ def append_csv(filename, row):
         writer.writerow(row)
 
 
-def run_monitor(manager, count, interval):
+def run_monitor(manager, count, interval, cseq_start=1):
     ok = other = to = 0
     total = count
     label = str(total) if total else "∞"
     i = 0
+    cseq = cseq_start
     try:
         while total == 0 or i < total:
             i += 1
             start = datetime.now(UTC).isoformat()
-            status, reason, rtt, _ = manager.send_options()
+            status, reason, rtt, _ = manager.send_options(cseq)
             append_csv(
                 "dimitri_stats.csv",
                 [start, manager.remote_ip, manager.remote_port, manager.protocol.lower(), status or "", reason, f"{rtt:.3f}"],
@@ -139,6 +140,7 @@ def run_monitor(manager, count, interval):
             else:
                 print(f"[{i}/{label}] {status} {reason} {rtt:.0f} ms")
                 other += 1
+            cseq += 1
             if total == 0 or i < total:
                 time.sleep(interval)
     except KeyboardInterrupt:
@@ -157,6 +159,7 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=float, default=1.0)
     parser.add_argument("--count", type=int, default=1, help="Número de OPTIONS a enviar (0=infinito)")
     parser.add_argument("--bind-ip", help="IP de origen")
+    parser.add_argument("--cseq-start", type=int, default=1, help="Valor inicial para CSeq")
     args = parser.parse_args()
 
     if args.protocol.lower() == "tcp":
@@ -176,7 +179,7 @@ if __name__ == "__main__":
             timeout=args.timeout if args.timeout else dst.timeout,
             src_ip=args.bind_ip or "0.0.0.0",
         )
-        run_monitor(manager, args.count, manager.interval)
+        run_monitor(manager, args.count, manager.interval, args.cseq_start)
     else:
         host = args.dst or args.host or "127.0.0.1"
         port = args.port if args.port is not None else args.dst_port
@@ -188,4 +191,4 @@ if __name__ == "__main__":
             timeout=args.timeout,
             src_ip=args.bind_ip or "0.0.0.0",
         )
-        run_monitor(manager, args.count, args.interval)
+        run_monitor(manager, args.count, args.interval, args.cseq_start)
