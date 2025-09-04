@@ -1,0 +1,16 @@
+{
+  "destinations": {
+    "local": {
+      "ip": "127.0.0.1",
+      "port": 5060,
+      "protocol": "UDP",
+      "interval": 5
+    },
+    "backup": {
+      "ip": "192.0.2.10",
+      "port": 5080,
+      "protocol": "TCP",
+      "interval": 10
+    }
+  }
+}
