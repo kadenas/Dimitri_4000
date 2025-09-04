@@ -70,6 +70,26 @@ Opciones principales:
 ```bash
 python app.py 10.1.72.188 5060 --count 2
 ```
+El log muestra el puerto efímero real desde el que se envía, por ejemplo:
+
+```
+2024-03-05 12:00:00,000 - sip_manager - INFO - Enviando OPTIONS a 10.1.72.188:5060 sent-by=10.1.64.18:53123
+```
+
+### Ejemplo con flags modernos
+
+```bash
+python app.py --dst 10.1.72.188 --dst-port 5060 --protocol udp --count 2 --interval 0.5 --timeout 2
+```
+El comando anterior crea/actualiza `dimitri_stats.csv` con las métricas.
+
+### CSeq incremental
+
+```bash
+python app.py 10.1.72.188 5060 --count 3 --cseq-start 7
+```
+
+Este comando envía tres OPTIONS con CSeq 7, 8 y 9.
 
 ### Ejemplo con flags modernos
 
