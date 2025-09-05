@@ -148,6 +148,25 @@ Ejemplo 2: solo responder:
   python app.py --service --reply-options --src-port 5060
   ```
 
+### UAS básico para INVITE
+
+El modo UAS responde a `INVITE` entrantes con `100/180/200` y gestiona el
+diálogo hasta `ACK/BYE`. Se habilita con `--uas`, lo que implica `--service`.
+
+Ejemplo 1: UAS que también responde a OPTIONS:
+
+```bash
+python app.py --uas --reply-options --bind-ip 10.1.64.18 --src-port 5060
+```
+
+Ejemplo 2: UAS con timbres y BYE automático tras 10 s:
+
+```bash
+python app.py --uas --uas-ring-delay 1 --uas-answer-after 3 --uas-talk-time 10 --bind-ip 10.1.64.18 --src-port 5062
+```
+
+Limitaciones: no soporta autenticación, PRACK ni Record-Route.
+
 ### Interfaz interactiva
 
 ```bash

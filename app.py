@@ -22,6 +22,9 @@ except Exception:
 from sip_manager import (
     SIPManager,
     build_options,
+    build_response,
+    build_sdp,
+    build_bye,
     parse_headers,
     status_from_response,
 )
@@ -52,8 +55,40 @@ def parse_args():
         default=0,
         help="Puerto UDP de origen (0 = efímero)",
     )
+    p.add_argument("--advertised-ip", help="IP anunciada en Contact/SDP", default=None)
       p.add_argument("--cseq-start", type=int, default=1, help="CSeq inicial (por defecto 1)")
       p.add_argument("--service", action="store_true", help="Modo servicio continuo")
+      p.add_argument("--uas", action="store_true", help="Habilita servidor SIP UAS")
+      p.add_argument(
+          "--uas-ring-delay",
+          type=float,
+          default=1.0,
+          help="Tiempo desde INVITE hasta enviar 180 Ringing",
+      )
+      p.add_argument(
+          "--uas-answer-after",
+          type=float,
+          default=2.0,
+          help="Tiempo desde INVITE hasta responder 200 OK",
+      )
+      p.add_argument(
+          "--uas-talk-time",
+          type=float,
+          default=0.0,
+          help="Si >0, tras ACK enviar BYE a los N segundos",
+      )
+      p.add_argument(
+          "--uas-codec",
+          choices=["pcmu", "pcma"],
+          default="pcmu",
+          help="Codec SDP para UAS",
+      )
+      p.add_argument(
+          "--uas-rtp-port",
+          type=int,
+          default=40002,
+          help="Puerto RTP anunciado por el UAS",
+      )
       p.add_argument(
           "--reply-options",
           action="store_true",
@@ -74,6 +109,9 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    if args.uas and not args.service:
+        args.service = True
 
     if args.reply_options and not args.service:
         raise SystemExit("--reply-options requiere --service")
@@ -138,12 +176,24 @@ def main():
             )
             raise SystemExit(1)
 
+        local_ip = args.bind_ip or sock.getsockname()[0]
         local_port = sock.getsockname()[1]
+        contact_ip = args.advertised_ip or local_ip
         user = "dimitri"
         tag_local = uuid.uuid4().hex[:8]
         pending = []  # call_id -> send_time
         cseq = args.cseq_start
         next_send = time.time()
+        dialogs: dict = {}
+        events: list = []
+
+        def schedule(key, typ, delay):
+            events.append({"time": time.time() + delay, "type": typ, "key": key})
+
+        def cancel_events(key, types=None):
+            events[:] = [
+                e for e in events if not (e["key"] == key and (types is None or e["type"] in types))
+            ]
 
         try:
             while True:
@@ -153,46 +203,53 @@ def main():
                     if pending
                     else None
                 )
+                next_event = min(e["time"] for e in events) if events else None
                 wait_send = max(0, next_send - now) if dst else None
                 wait_to = max(0, next_timeout - now) if next_timeout else None
+                wait_evt = max(0, next_event - now) if next_event else None
                 timeout = None
-                if wait_send is not None and wait_to is not None:
-                    timeout = min(wait_send, wait_to)
-                elif wait_send is not None:
-                    timeout = wait_send
-                elif wait_to is not None:
-                    timeout = wait_to
+                for w in (wait_send, wait_to, wait_evt):
+                    if w is None:
+                        continue
+                    timeout = w if timeout is None else min(timeout, w)
 
                 r, _, _ = select.select([sock], [], [], timeout)
                 now = time.time()
 
                 if r:
                     data, addr = sock.recvfrom(4096)
-                    if data.startswith(b"SIP/2.0"):
-                        _, headers = parse_headers(data)
+                    start, headers = parse_headers(data)
+                    if start.startswith("SIP/2.0"):
                         call_id = headers.get("call-id")
                         code, reason = status_from_response(data)
-                        for p in list(pending):
-                            if p["call_id"] == call_id:
-                                rtt_ms = int((now - p["send_time"]) * 1000)
-                                ts = datetime.now(UTC).isoformat()
-                                write_csv_row(
-                                    csv_path,
-                                    [
-                                        ts,
-                                        p["dst"],
-                                        p["dport"],
-                                        args.protocol,
-                                        code,
-                                        reason,
-                                        rtt_ms,
-                                    ],
-                                    header,
-                                )
-                                pending.remove(p)
-                                break
-                    elif data.startswith(b"OPTIONS sip:") and args.reply_options:
-                        start, headers = parse_headers(data)
+                        cseq_hdr = headers.get("cseq", "")
+                        if cseq_hdr.endswith("BYE"):
+                            for key, d in list(dialogs.items()):
+                                if d["call_id"] == call_id and d.get("state") == "bye_sent":
+                                    cancel_events(key)
+                                    dialogs.pop(key, None)
+                                    break
+                        else:
+                            for p in list(pending):
+                                if p["call_id"] == call_id:
+                                    rtt_ms = int((now - p["send_time"]) * 1000)
+                                    ts = datetime.now(UTC).isoformat()
+                                    write_csv_row(
+                                        csv_path,
+                                        [
+                                            ts,
+                                            p["dst"],
+                                            p["dport"],
+                                            args.protocol,
+                                            code,
+                                            reason,
+                                            rtt_ms,
+                                        ],
+                                        header,
+                                    )
+                                    pending.remove(p)
+                                    break
+                    elif start.startswith("OPTIONS sip:") and args.reply_options:
                         try:
                             via = headers["via"]
                             fr = headers["from"]
@@ -207,14 +264,14 @@ def main():
                             if "tag=" not in to.lower():
                                 to = f"{to};tag={tag_local}"
                             if args.bind_ip:
-                                contact_ip = args.bind_ip
+                                contact_ip_resp = args.bind_ip
                             else:
                                 tmp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                                 try:
                                     tmp.connect(addr)
-                                    contact_ip = tmp.getsockname()[0]
+                                    contact_ip_resp = tmp.getsockname()[0]
                                 except OSError:
-                                    contact_ip = sock.getsockname()[0]
+                                    contact_ip_resp = sock.getsockname()[0]
                                 finally:
                                     tmp.close()
                             resp = (
@@ -224,7 +281,7 @@ def main():
                                 f"To: {to}\r\n"
                                 f"Call-ID: {call_id}\r\n"
                                 f"CSeq: {cseq_hdr}\r\n"
-                                f"Contact: <sip:{user}@{contact_ip}>\r\n"
+                                f"Contact: <sip:{user}@{contact_ip_resp}>\r\n"
                                 "User-Agent: Dimitri-4000/0.1\r\n"
                                 "Allow: INVITE, ACK, CANCEL, OPTIONS, BYE\r\n"
                                 "Accept: application/sdp\r\n"
@@ -235,6 +292,157 @@ def main():
                             logger.info(
                                 f"Responded 200 OK to OPTIONS from {addr[0]}:{addr[1]} cid={call_id} cseq={cseq_num}"
                             )
+                    elif args.uas and start.startswith("INVITE "):
+                        try:
+                            via = headers["via"]
+                            fr = headers["from"]
+                            to = headers["to"]
+                            call_id = headers["call-id"]
+                            cseq_hdr = headers["cseq"]
+                        except KeyError:
+                            logger.debug("INVITE incompleto de %s:%s", addr[0], addr[1])
+                        else:
+                            remote_tag = None
+                            if "tag=" in fr.lower():
+                                remote_tag = fr.split("tag=")[1].split(";", 1)[0]
+                            local_tag = uuid.uuid4().hex[:8]
+                            key = (call_id, remote_tag)
+                            peer_uri = headers.get("contact")
+                            if peer_uri and "<" in peer_uri and ">" in peer_uri:
+                                peer_uri = peer_uri.split("<", 1)[1].split(">", 1)[0]
+                            else:
+                                peer_uri = fr.split("<", 1)[1].split(">", 1)[0]
+                            dialog = {
+                                "peer_addr": addr,
+                                "from_uri": fr,
+                                "to_uri": to.split(";", 1)[0],
+                                "call_id": call_id,
+                                "remote_tag": remote_tag,
+                                "local_tag": local_tag,
+                                "their_cseq_invite": cseq_hdr.split()[0],
+                                "our_next_cseq": 1,
+                                "peer_uri": peer_uri,
+                                "start_ts": now,
+                                "state": "invited",
+                                "via": via,
+                                "cseq_hdr": cseq_hdr,
+                                "local_ip": contact_ip,
+                                "local_port": local_port,
+                            }
+                            dialogs[key] = dialog
+                            resp = build_response(
+                                100,
+                                "Trying",
+                                {
+                                    "Via": via,
+                                    "From": fr,
+                                    "To": to,
+                                    "Call-ID": call_id,
+                                    "CSeq": cseq_hdr,
+                                },
+                            )
+                            sock.sendto(resp, addr)
+                            schedule(key, "ring", args.uas_ring_delay)
+                            schedule(key, "answer", args.uas_answer_after)
+                    elif args.uas and start.startswith("CANCEL "):
+                        try:
+                            via = headers["via"]
+                            fr = headers["from"]
+                            to = headers["to"]
+                            call_id = headers["call-id"]
+                            cseq_hdr = headers["cseq"]
+                        except KeyError:
+                            logger.debug("CANCEL incompleto de %s:%s", addr[0], addr[1])
+                        else:
+                            remote_tag = None
+                            if "tag=" in fr.lower():
+                                remote_tag = fr.split("tag=")[1].split(";", 1)[0]
+                            key = (call_id, remote_tag)
+                            dialog = dialogs.get(key)
+                            to_resp = to
+                            if dialog:
+                                to_resp = f"{dialog['to_uri']};tag={dialog['local_tag']}"
+                                cancel_events(key)
+                                dialog["state"] = "cancelled"
+                            resp = build_response(
+                                200,
+                                "OK",
+                                {
+                                    "Via": via,
+                                    "From": fr,
+                                    "To": to_resp,
+                                    "Call-ID": call_id,
+                                    "CSeq": cseq_hdr,
+                                },
+                            )
+                            sock.sendto(resp, addr)
+                            if dialog:
+                                resp487 = build_response(
+                                    487,
+                                    "Request Terminated",
+                                    {
+                                        "Via": dialog["via"],
+                                        "From": fr,
+                                        "To": to_resp,
+                                        "Call-ID": call_id,
+                                        "CSeq": dialog["cseq_hdr"],
+                                    },
+                                )
+                                sock.sendto(resp487, addr)
+                                schedule(key, "del", 5)
+                    elif args.uas and start.startswith("ACK "):
+                        try:
+                            fr = headers["from"]
+                            call_id = headers["call-id"]
+                        except KeyError:
+                            pass
+                        else:
+                            remote_tag = None
+                            if "tag=" in fr.lower():
+                                remote_tag = fr.split("tag=")[1].split(";", 1)[0]
+                            key = (call_id, remote_tag)
+                            dialog = dialogs.get(key)
+                            if dialog:
+                                if dialog.get("state") == "cancelled":
+                                    cancel_events(key)
+                                    dialogs.pop(key, None)
+                                elif dialog.get("state") == "answered":
+                                    dialog["state"] = "established"
+                                    cancel_events(key, ["200_retx", "timer_m"])
+                                    if args.uas_talk_time > 0:
+                                        schedule(key, "bye", args.uas_talk_time)
+                    elif args.uas and start.startswith("BYE "):
+                        try:
+                            via = headers["via"]
+                            fr = headers["from"]
+                            to = headers["to"]
+                            call_id = headers["call-id"]
+                            cseq_hdr = headers["cseq"]
+                        except KeyError:
+                            logger.debug("BYE incompleto de %s:%s", addr[0], addr[1])
+                        else:
+                            remote_tag = None
+                            if "tag=" in fr.lower():
+                                remote_tag = fr.split("tag=")[1].split(";", 1)[0]
+                            key = (call_id, remote_tag)
+                            dialog = dialogs.get(key)
+                            to_resp = to
+                            if dialog:
+                                to_resp = f"{dialog['to_uri']};tag={dialog['local_tag']}"
+                            resp = build_response(
+                                200,
+                                "OK",
+                                {
+                                    "Via": via,
+                                    "From": fr,
+                                    "To": to_resp,
+                                    "Call-ID": call_id,
+                                    "CSeq": cseq_hdr,
+                                },
+                            )
+                            sock.sendto(resp, addr)
+                            cancel_events(key)
+                            dialogs.pop(key, None)
                     else:
                         logger.debug(
                             "Datagrama ignorado de %s:%s", addr[0], addr[1]
@@ -257,6 +465,76 @@ def main():
                                 header,
                             )
                             pending.remove(p)
+
+                # ejecutar eventos programados
+                for ev in list(events):
+                    if now >= ev["time"]:
+                        key = ev["key"]
+                        dialog = dialogs.get(key)
+                        if not dialog:
+                            events.remove(ev)
+                            continue
+                        etype = ev["type"]
+                        if etype == "ring":
+                            headers = {
+                                "Via": dialog["via"],
+                                "From": dialog["from_uri"],
+                                "To": f"{dialog['to_uri']};tag={dialog['local_tag']}",
+                                "Call-ID": dialog["call_id"],
+                                "CSeq": dialog["cseq_hdr"],
+                            }
+                            sock.sendto(
+                                build_response(180, "Ringing", headers), dialog["peer_addr"]
+                            )
+                            dialog["state"] = "ringing"
+                        elif etype == "answer":
+                            headers = {
+                                "Via": dialog["via"],
+                                "From": dialog["from_uri"],
+                                "To": f"{dialog['to_uri']};tag={dialog['local_tag']}",
+                                "Call-ID": dialog["call_id"],
+                                "CSeq": dialog["cseq_hdr"],
+                                "Contact": f"<sip:{user}@{contact_ip}>",
+                                "Content-Type": "application/sdp",
+                            }
+                            sdp = build_sdp(contact_ip, args.uas_rtp_port, args.uas_codec)
+                            sock.sendto(
+                                build_response(200, "OK", headers, sdp), dialog["peer_addr"]
+                            )
+                            dialog["state"] = "answered"
+                            dialog["retx"] = 0.5
+                            schedule(key, "200_retx", dialog["retx"])
+                            schedule(key, "timer_m", 0.5 * 64)
+                        elif etype == "200_retx":
+                            if dialog.get("state") == "answered":
+                                headers = {
+                                    "Via": dialog["via"],
+                                    "From": dialog["from_uri"],
+                                    "To": f"{dialog['to_uri']};tag={dialog['local_tag']}",
+                                    "Call-ID": dialog["call_id"],
+                                    "CSeq": dialog["cseq_hdr"],
+                                    "Contact": f"<sip:{user}@{contact_ip}>",
+                                    "Content-Type": "application/sdp",
+                                }
+                                sdp = build_sdp(contact_ip, args.uas_rtp_port, args.uas_codec)
+                                sock.sendto(
+                                    build_response(200, "OK", headers, sdp),
+                                    dialog["peer_addr"],
+                                )
+                                dialog["retx"] = min(dialog["retx"] * 2, 4)
+                                schedule(key, "200_retx", dialog["retx"])
+                        elif etype == "timer_m":
+                            dialogs.pop(key, None)
+                            cancel_events(key)
+                        elif etype == "bye":
+                            bye = build_bye(dialog)
+                            sock.sendto(bye, dialog["peer_addr"])
+                            dialog["state"] = "bye_sent"
+                            schedule(key, "del", 5)
+                        elif etype == "del":
+                            dialogs.pop(key, None)
+                            cancel_events(key)
+                        events.remove(ev)
 
                 if dst and now >= next_send:
                     if args.bind_ip:
