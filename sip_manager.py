@@ -305,132 +305,165 @@ class SIPManager:
         next_resend = t_start + t1
         ring_deadline = t_start + ring_timeout
         canceled = False
+        cancel_deadline = None
         contact_uri = to_uri
         to_header = f"<{to_uri}>"
         setup_ms = None
         result = "timeout"
 
-        while True:
-            now = time.monotonic()
-            if not canceled and now >= ring_deadline:
-                cancel = build_cancel(
-                    to_uri,
-                    local_ip,
-                    local_port,
-                    from_user,
-                    call_id,
-                    cseq_start,
-                    tag,
-                    branch,
-                )
-                s.send(cancel)
-                logger.info("Ring timeout, enviado CANCEL")
-                canceled = True
-                continue
-
-            try:
-                data = s.recv(4096)
-            except socket.timeout:
+        try:
+            while True:
                 now = time.monotonic()
-                if not canceled and now >= next_resend:
-                    s.send(invite)
-                    t1 = min(t1 * 2, 4.0)
-                    next_resend = now + t1
-                continue
-
-            code, reason = status_from_response(data)
-            start, headers = parse_headers(data)
-            if code in (100, 180, 183):
-                logger.info(f"Recibido {code} {reason}")
-                continue
-
-            if code == 200:
-                if canceled:
-                    logger.info("200 OK tras CANCEL")
+                if not canceled and now >= ring_deadline:
+                    cancel = build_cancel(
+                        to_uri,
+                        local_ip,
+                        local_port,
+                        from_user,
+                        call_id,
+                        cseq_start,
+                        tag,
+                        branch,
+                    )
+                    s.send(cancel)
+                    logger.info("Ring timeout, enviado CANCEL")
+                    canceled = True
+                    cancel_deadline = now + 5
                     continue
-                setup_ms = int((time.monotonic() - t_start) * 1000)
-                logger.info(f"200 OK en {setup_ms} ms")
-                to_header = headers.get("to", to_header)
-                contact = headers.get("contact")
-                if contact:
-                    contact_uri, host, port = _contact_uri_host_port(contact)
-                    try:
-                        s.connect((host, port))
-                    except OSError:
-                        pass
-                ack = build_ack(
-                    contact_uri,
-                    to_header,
-                    local_ip,
-                    local_port,
-                    from_user,
-                    call_id,
-                    cseq_start,
-                    tag,
-                )
-                s.send(ack)
-                if talk_time > 0:
-                    time.sleep(talk_time)
-                    bye = build_bye(
+
+                if canceled and cancel_deadline and now >= cancel_deadline:
+                    result = "canceled-timeout"
+                    break
+
+                try:
+                    data = s.recv(4096)
+                except socket.timeout:
+                    now = time.monotonic()
+                    if not canceled and now >= next_resend:
+                        s.send(invite)
+                        t1 = min(t1 * 2, 4.0)
+                        next_resend = now + t1
+                    continue
+
+                code, reason = status_from_response(data)
+                start, headers = parse_headers(data)
+
+                if canceled:
+                    if code == 200:
+                        logger.info("200 OK tras CANCEL")
+                        continue
+                    if code == 487:
+                        to_header = headers.get("to", to_header)
+                        ack = build_ack(
+                            to_uri,
+                            to_header,
+                            local_ip,
+                            local_port,
+                            from_user,
+                            call_id,
+                            cseq_start,
+                            tag,
+                        )
+                        s.send(ack)
+                        setup_ms = int((time.monotonic() - t_start) * 1000)
+                        result = "canceled"
+                        break
+                    continue
+
+                if code in (100, 180, 183):
+                    logger.info(f"Recibido {code} {reason}")
+                    continue
+
+                if code == 200:
+                    setup_ms = int((time.monotonic() - t_start) * 1000)
+                    logger.info(f"200 OK en {setup_ms} ms")
+                    to_header = headers.get("to", to_header)
+                    contact = headers.get("contact")
+                    if contact:
+                        contact_uri, host, port = _contact_uri_host_port(contact)
+                        try:
+                            s.connect((host, port))
+                        except OSError:
+                            pass
+                    ack = build_ack(
                         contact_uri,
                         to_header,
                         local_ip,
                         local_port,
                         from_user,
                         call_id,
-                        cseq_start + 1,
+                        cseq_start,
                         tag,
                     )
-                    s.send(bye)
-                    while True:
-                        try:
-                            data2 = s.recv(4096)
-                        except socket.timeout:
-                            break
-                        c2, _ = status_from_response(data2)
-                        if c2 == 200:
-                            logger.info("200 OK al BYE")
-                            break
-                result = "answered"
-                break
+                    s.send(ack)
+                    if talk_time > 0:
+                        time.sleep(talk_time)
+                        bye = build_bye(
+                            contact_uri,
+                            to_header,
+                            local_ip,
+                            local_port,
+                            from_user,
+                            call_id,
+                            cseq_start + 1,
+                            tag,
+                        )
+                        s.send(bye)
+                        while True:
+                            try:
+                                data2 = s.recv(4096)
+                            except socket.timeout:
+                                break
+                            c2, _ = status_from_response(data2)
+                            if c2 == 200:
+                                logger.info("200 OK al BYE")
+                                break
+                    result = "answered"
+                    break
 
-            if code == 487:
-                to_header = headers.get("to", to_header)
-                ack = build_ack(
-                    to_uri,
-                    to_header,
-                    local_ip,
-                    local_port,
-                    from_user,
-                    call_id,
-                    cseq_start,
-                    tag,
-                )
-                s.send(ack)
-                setup_ms = int((time.monotonic() - t_start) * 1000)
-                result = "canceled"
-                break
+                if code == 487:
+                    to_header = headers.get("to", to_header)
+                    ack = build_ack(
+                        to_uri,
+                        to_header,
+                        local_ip,
+                        local_port,
+                        from_user,
+                        call_id,
+                        cseq_start,
+                        tag,
+                    )
+                    s.send(ack)
+                    setup_ms = int((time.monotonic() - t_start) * 1000)
+                    result = "canceled"
+                    break
 
-            if code is not None and code >= 400:
-                to_header = headers.get("to", to_header)
-                ack = build_ack(
-                    to_uri,
-                    to_header,
-                    local_ip,
-                    local_port,
-                    from_user,
-                    call_id,
-                    cseq_start,
-                    tag,
-                )
-                s.send(ack)
-                setup_ms = int((time.monotonic() - t_start) * 1000)
-                if code == 486:
-                    result = "busy(486)"
-                else:
-                    result = f"rejected({code})"
-                break
+                if code is not None and code >= 400:
+                    to_header = headers.get("to", to_header)
+                    ack = build_ack(
+                        to_uri,
+                        to_header,
+                        local_ip,
+                        local_port,
+                        from_user,
+                        call_id,
+                        cseq_start,
+                        tag,
+                    )
+                    s.send(ack)
+                    setup_ms = int((time.monotonic() - t_start) * 1000)
+                    if code == 486:
+                        result = "busy(486)"
+                    else:
+                        result = f"rejected({code})"
+                    break
 
-        s.close()
+        except KeyboardInterrupt:
+            logger.info("Llamada abortada por usuario")
+            result = "aborted"
+            raise
+        finally:
+            s.close()
+
         talk_s = talk_time if result == "answered" else 0
         return call_id, result, setup_ms or 0, talk_s

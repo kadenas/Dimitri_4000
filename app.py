@@ -109,6 +109,8 @@ def main():
                 codec=args.codec,
                 rtp_port=args.rtp_port,
             )
+        except KeyboardInterrupt:
+            raise SystemExit(130)
         except OSError as e:
             logger.error(
                 f"No se pudo bindear UDP en {args.bind_ip or '0.0.0.0'}:{args.src_port}: {e}"
