@@ -181,6 +181,13 @@ Intento con CANCEL por no respuesta:
 python app.py --invite --to sip:10.1.72.188 --dst 10.1.72.188 --ring-timeout 5 --talk-time 0
 ```
 
+### Timeout y CANCEL
+
+Cuando se supera `--ring-timeout` se envía un `CANCEL` y se espera hasta 5 s
+por las respuestas finales. Si llega `487 Request Terminated` se responde con
+`ACK` y la llamada termina con `result=canceled`. Si no llega nada en ese plazo,
+se finaliza con `result=canceled-timeout`.
+
 Limitaciones actuales: no soporta autenticación, PRACK ni manejo de SDP
 de respuesta.
 
