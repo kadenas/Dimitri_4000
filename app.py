@@ -44,7 +44,7 @@ def parse_args():
     p.add_argument("--protocol", choices=["udp", "tcp"], default="udp", help="Transporte")
     p.add_argument("--interval", type=float, default=1.0, help="Intervalo entre envíos (s)")
     p.add_argument("--timeout", type=float, default=2.0, help="Timeout de socket (s)")
-    p.add_argument("--count", type=int, default=1, help="Número de OPTIONS a enviar")
+      p.add_argument("--count", type=int, default=1, help="Número de OPTIONS a enviar")
     p.add_argument("--bind-ip", default=None, help="IP local desde la que salir (opcional)")
     p.add_argument(
         "--src-port",
@@ -52,13 +52,20 @@ def parse_args():
         default=0,
         help="Puerto UDP de origen (0 = efímero)",
     )
-    p.add_argument("--cseq-start", type=int, default=1, help="CSeq inicial (por defecto 1)")
-    p.add_argument("--service", action="store_true", help="Modo servicio continuo")
-    p.add_argument(
-        "--reply-options",
-        action="store_true",
-        help="Responder 200 OK a OPTIONS entrantes",
-    )
+      p.add_argument("--cseq-start", type=int, default=1, help="CSeq inicial (por defecto 1)")
+      p.add_argument("--service", action="store_true", help="Modo servicio continuo")
+      p.add_argument(
+          "--reply-options",
+          action="store_true",
+          help="Responder 200 OK a OPTIONS entrantes",
+      )
+      p.add_argument("--invite", action="store_true", help="Realizar una llamada básica")
+      p.add_argument("--to", help="URI destino para INVITE")
+      p.add_argument("--from-user", default="dimitri", help="Usuario origen")
+      p.add_argument("--ring-timeout", type=float, default=15.0, help="Tiempo de espera antes de cancelar")
+      p.add_argument("--talk-time", type=float, default=5.0, help="Tiempo de conversación antes de enviar BYE")
+      p.add_argument("--codec", choices=["pcmu", "pcma"], default="pcmu", help="Codec SDP")
+      p.add_argument("--rtp-port", type=int, default=40000, help="Puerto RTP local")
     # Compatibilidad con la CLI antigua: host [port]
     p.add_argument("host", nargs="?", help="Destino (compat)")
     p.add_argument("port", nargs="?", type=int, help="Puerto destino (compat)")
@@ -71,11 +78,49 @@ def main():
     if args.reply_options and not args.service:
         raise SystemExit("--reply-options requiere --service")
 
+    if args.invite and args.service:
+        raise SystemExit("--invite incompatible con --service")
+
     dst = args.dst or args.host
     dport = args.dst_port if args.dst else (args.port or 5060)
 
     csv_path = "dimitri_stats.csv"
     header = ["ts_iso", "dst", "dst_port", "protocol", "status_code", "reason", "rtt_ms"]
+
+    if args.invite:
+        if not dst:
+            raise SystemExit("Falta destino: usa --dst 10.0.0.1")
+        if not args.to:
+            raise SystemExit("Falta --to sip:usuario@host")
+        to_uri = args.to if args.to.startswith("sip:") else f"sip:{args.to}"
+        sm = SIPManager(protocol=args.protocol)
+        try:
+            call_id, result, setup_ms, talk_s = sm.place_call(
+                dst_host=dst,
+                dst_port=dport,
+                to_uri=to_uri,
+                from_user=args.from_user,
+                bind_ip=args.bind_ip,
+                bind_port=args.src_port,
+                timeout=args.timeout,
+                cseq_start=args.cseq_start,
+                ring_timeout=args.ring_timeout,
+                talk_time=args.talk_time,
+                codec=args.codec,
+                rtp_port=args.rtp_port,
+            )
+        except OSError as e:
+            logger.error(
+                f"No se pudo bindear UDP en {args.bind_ip or '0.0.0.0'}:{args.src_port}: {e}"
+            )
+            raise SystemExit(1)
+        ts = datetime.now(UTC).isoformat()
+        header = ["ts_iso", "call_id", "to", "result", "setup_ms", "talk_s"]
+        write_csv_row(
+            "dimitri_calls.csv", [ts, call_id, to_uri, result, setup_ms, talk_s], header
+        )
+        print(f"Llamada {result} (setup={setup_ms} ms)")
+        return
 
     if args.service:
         if not dst and not args.reply_options:

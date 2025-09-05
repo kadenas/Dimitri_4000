@@ -145,8 +145,8 @@ python app.py --service --reply-options --src-port 5060 --dst 10.1.72.188 --dst-
 Ejemplo 2: solo responder:
 
 ```bash
-python app.py --service --reply-options --src-port 5060
-```
+  python app.py --service --reply-options --src-port 5060
+  ```
 
 ### Interfaz interactiva
 
@@ -160,9 +160,29 @@ Atajos dentro de la interfaz:
 - `i` – Envía un INVITE con cabeceras personalizadas separadas por `;`.
 - `q` – Sale de la aplicación.
 
-La pantalla muestra la latencia de las respuestas, contadores de éxito y fallo,
-un log de las últimas acciones y un indicador en color verde o rojo según el
-resultado del último OPTIONS.
+  La pantalla muestra la latencia de las respuestas, contadores de éxito y fallo,
+  un log de las últimas acciones y un indicador en color verde o rojo según el
+  resultado del último OPTIONS.
+
+## Llamadas de prueba (INVITE)
+
+Permite establecer una llamada básica enviando INVITE/ACK/BYE o cancelar si no
+hay respuesta.
+
+Llamada completa y colgar a los 5 s:
+
+```bash
+python app.py --invite --to sip:10.1.72.188 --dst 10.1.72.188 --dst-port 5060 --src-port 5062 --talk-time 5 --ring-timeout 15
+```
+
+Intento con CANCEL por no respuesta:
+
+```bash
+python app.py --invite --to sip:10.1.72.188 --dst 10.1.72.188 --ring-timeout 5 --talk-time 0
+```
+
+Limitaciones actuales: no soporta autenticación, PRACK ni manejo de SDP
+de respuesta.
 
 ### Monitorización desde script
 
