@@ -4,8 +4,6 @@ import time
 import uuid
 from typing import Tuple
 
-from sdp import build_sdp
-
 logger = logging.getLogger("socket_handler")
 
 
@@ -130,7 +128,7 @@ def build_cancel(
     return msg.encode()
 
 
-def build_bye(
+def build_bye_request(
     request_uri: str,
     to_header: str,
     local_ip: str,
@@ -140,6 +138,7 @@ def build_bye(
     cseq: int,
     tag: str,
 ) -> bytes:
+    """Build a BYE request for the caller side (UAC)."""
     branch = "z9hG4bK" + uuid.uuid4().hex
     sent_by = f"{local_ip}:{local_port}"
     msg = (
@@ -171,6 +170,67 @@ def _contact_uri_host_port(contact: str) -> Tuple[str, str, int]:
     else:
         host, port = hostport, 5060
     return uri, host, port
+
+
+def build_response(
+    status: int,
+    reason: str,
+    headers: dict,
+    body: bytes | str = b"",
+) -> bytes:
+    """Build a generic SIP response."""
+    lines = [f"SIP/2.0 {status} {reason}\r\n"]
+    for k, v in headers.items():
+        lines.append(f"{k}: {v}\r\n")
+    if body:
+        if isinstance(body, str):
+            body = body.encode()
+        lines.append(f"Content-Length: {len(body)}\r\n\r\n")
+        return ("".join(lines).encode() + body)
+    else:
+        lines.append("Content-Length: 0\r\n\r\n")
+        return "".join(lines).encode()
+
+
+def build_sdp(local_ip: str, rtp_port: int, codec: str) -> str:
+    """Return a minimal SDP offer/answer."""
+    codec = codec.lower()
+    if codec not in {"pcmu", "pcma"}:
+        codec = "pcmu"
+    pt = 0 if codec == "pcmu" else 8
+    return (
+        "v=0\r\n"
+        f"o=dimitri 0 0 IN IP4 {local_ip}\r\n"
+        "s=Dimitri-4000\r\n"
+        f"c=IN IP4 {local_ip}\r\n"
+        "t=0 0\r\n"
+        f"m=audio {rtp_port} RTP/AVP {pt}\r\n"
+        f"a=rtpmap:{pt} {codec.upper()}/8000\r\n"
+    )
+
+
+def build_bye(dialog: dict) -> bytes:
+    """Build a BYE request from stored dialog information (UAS side)."""
+    branch = "z9hG4bK" + uuid.uuid4().hex
+    sent_by = f"{dialog['local_ip']}:{dialog['local_port']}"
+    req_uri = dialog.get("peer_uri")
+    from_hdr = f"{dialog['to_uri']};tag={dialog['local_tag']}"
+    to_hdr = dialog['from_uri']
+    cseq = dialog['our_next_cseq']
+    dialog['our_next_cseq'] += 1
+    msg = (
+        f"BYE {req_uri} SIP/2.0\r\n"
+        f"Via: SIP/2.0/UDP {sent_by};branch={branch};rport\r\n"
+        "Max-Forwards: 70\r\n"
+        f"From: {from_hdr}\r\n"
+        f"To: {to_hdr}\r\n"
+        f"Call-ID: {dialog['call_id']}\r\n"
+        f"CSeq: {cseq} BYE\r\n"
+        f"Contact: <sip:dimitri@{dialog['local_ip']}>\r\n"
+        "User-Agent: Dimitri-4000/0.1\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    return msg.encode()
 
 
 def parse_headers(data: bytes):
@@ -398,7 +458,7 @@ class SIPManager:
                     s.send(ack)
                     if talk_time > 0:
                         time.sleep(talk_time)
-                        bye = build_bye(
+                        bye = build_bye_request(
                             contact_uri,
                             to_header,
                             local_ip,
