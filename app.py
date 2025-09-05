@@ -47,7 +47,7 @@ def parse_args():
     p.add_argument("--protocol", choices=["udp", "tcp"], default="udp", help="Transporte")
     p.add_argument("--interval", type=float, default=1.0, help="Intervalo entre envíos (s)")
     p.add_argument("--timeout", type=float, default=2.0, help="Timeout de socket (s)")
-      p.add_argument("--count", type=int, default=1, help="Número de OPTIONS a enviar")
+    p.add_argument("--count", type=int, default=1, help="Número de OPTIONS a enviar")
     p.add_argument("--bind-ip", default=None, help="IP local desde la que salir (opcional)")
     p.add_argument(
         "--src-port",
@@ -56,51 +56,51 @@ def parse_args():
         help="Puerto UDP de origen (0 = efímero)",
     )
     p.add_argument("--advertised-ip", help="IP anunciada en Contact/SDP", default=None)
-      p.add_argument("--cseq-start", type=int, default=1, help="CSeq inicial (por defecto 1)")
-      p.add_argument("--service", action="store_true", help="Modo servicio continuo")
-      p.add_argument("--uas", action="store_true", help="Habilita servidor SIP UAS")
-      p.add_argument(
-          "--uas-ring-delay",
-          type=float,
-          default=1.0,
-          help="Tiempo desde INVITE hasta enviar 180 Ringing",
-      )
-      p.add_argument(
-          "--uas-answer-after",
-          type=float,
-          default=2.0,
-          help="Tiempo desde INVITE hasta responder 200 OK",
-      )
-      p.add_argument(
-          "--uas-talk-time",
-          type=float,
-          default=0.0,
-          help="Si >0, tras ACK enviar BYE a los N segundos",
-      )
-      p.add_argument(
-          "--uas-codec",
-          choices=["pcmu", "pcma"],
-          default="pcmu",
-          help="Codec SDP para UAS",
-      )
-      p.add_argument(
-          "--uas-rtp-port",
-          type=int,
-          default=40002,
-          help="Puerto RTP anunciado por el UAS",
-      )
-      p.add_argument(
-          "--reply-options",
-          action="store_true",
-          help="Responder 200 OK a OPTIONS entrantes",
-      )
-      p.add_argument("--invite", action="store_true", help="Realizar una llamada básica")
-      p.add_argument("--to", help="URI destino para INVITE")
-      p.add_argument("--from-user", default="dimitri", help="Usuario origen")
-      p.add_argument("--ring-timeout", type=float, default=15.0, help="Tiempo de espera antes de cancelar")
-      p.add_argument("--talk-time", type=float, default=5.0, help="Tiempo de conversación antes de enviar BYE")
-      p.add_argument("--codec", choices=["pcmu", "pcma"], default="pcmu", help="Codec SDP")
-      p.add_argument("--rtp-port", type=int, default=40000, help="Puerto RTP local")
+    p.add_argument("--cseq-start", type=int, default=1, help="CSeq inicial (por defecto 1)")
+    p.add_argument("--service", action="store_true", help="Modo servicio continuo")
+    p.add_argument("--uas", action="store_true", help="Habilita servidor SIP UAS")
+    p.add_argument(
+        "--uas-ring-delay",
+        type=float,
+        default=1.0,
+        help="Tiempo desde INVITE hasta enviar 180 Ringing",
+    )
+    p.add_argument(
+        "--uas-answer-after",
+        type=float,
+        default=2.0,
+        help="Tiempo desde INVITE hasta responder 200 OK",
+    )
+    p.add_argument(
+        "--uas-talk-time",
+        type=float,
+        default=0.0,
+        help="Si >0, tras ACK enviar BYE a los N segundos",
+    )
+    p.add_argument(
+        "--uas-codec",
+        choices=["pcmu", "pcma"],
+        default="pcmu",
+        help="Codec SDP para UAS",
+    )
+    p.add_argument(
+        "--uas-rtp-port",
+        type=int,
+        default=40002,
+        help="Puerto RTP anunciado por el UAS",
+    )
+    p.add_argument(
+        "--reply-options",
+        action="store_true",
+        help="Responder 200 OK a OPTIONS entrantes",
+    )
+    p.add_argument("--invite", action="store_true", help="Realizar una llamada básica")
+    p.add_argument("--to", help="URI destino para INVITE")
+    p.add_argument("--from-user", default="dimitri", help="Usuario origen")
+    p.add_argument("--ring-timeout", type=float, default=15.0, help="Tiempo de espera antes de cancelar")
+    p.add_argument("--talk-time", type=float, default=5.0, help="Tiempo de conversación antes de enviar BYE")
+    p.add_argument("--codec", choices=["pcmu", "pcma"], default="pcmu", help="Codec SDP")
+    p.add_argument("--rtp-port", type=int, default=40000, help="Puerto RTP local")
     # Compatibilidad con la CLI antigua: host [port]
     p.add_argument("host", nargs="?", help="Destino (compat)")
     p.add_argument("port", nargs="?", type=int, help="Puerto destino (compat)")
