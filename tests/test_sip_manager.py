@@ -1,80 +1,33 @@
-import socket
-from contextlib import contextmanager
 from pathlib import Path
 import sys
 
-import pytest
-
 sys.path.append(str(Path(__file__).resolve().parents[1]))
-from sip_manager import SIPManager
+
+from sip_manager import build_options, parse_headers, status_from_response
 
 
-@contextmanager
-def dummy_udp_socket(remote_ip, remote_port, *args, **kwargs):
-    """Yield a dummy socket and the provided remote address."""
-    yield object(), (remote_ip, remote_port)
+def test_status_from_response_parses_code_and_reason():
+    data = b"SIP/2.0 486 Busy Here\r\n\r\n"
+    code, reason = status_from_response(data)
+    assert code == 486
+    assert reason == "Busy Here"
 
 
-def test_build_options_message():
-    manager = SIPManager("198.51.100.10", user="alice")
-    msg = manager.build_options()
-    assert msg.startswith("OPTIONS sip:198.51.100.10 SIP/2.0")
-    assert "Content-Length: 0" in msg
-    assert "Via: SIP/2.0/UDP" in msg
+def test_parse_headers_extracts_fields():
+    msg = (
+        b"SIP/2.0 200 OK\r\n"
+        b"Contact: <sip:alice@10.0.0.1>\r\n"
+        b"To: <sip:bob@10.0.0.2>;tag=abc\r\n\r\n"
+    )
+    start, headers = parse_headers(msg)
+    assert start.startswith("SIP/2.0 200")
+    assert headers["contact"].startswith("<sip:alice@")
+    assert headers["to"].endswith("tag=abc")
 
 
-def test_build_invite_with_custom_headers():
-    manager = SIPManager("198.51.100.10", user="alice")
-    msg = manager.build_invite({"User-Agent": "pytest"})
-    assert "INVITE sip:198.51.100.10 SIP/2.0" in msg
-    assert "User-Agent: pytest" in msg
-    assert "Content-Length: 0" in msg
-    # mandatory header
-    assert "Via: SIP/2.0/UDP" in msg
-
-
-def test_send_request_parses_response(monkeypatch):
-    manager = SIPManager("198.51.100.10")
-
-    monkeypatch.setattr("sip_manager.open_udp_socket", dummy_udp_socket)
-
-    sent_messages = []
-
-    def fake_send(sock, data, addr):
-        sent_messages.append(data)
-
-    def fake_recv(sock):
-        return b"SIP/2.0 200 OK\r\n\r\n", ("198.51.100.10", 5060)
-
-    monkeypatch.setattr("sip_manager.udp_send", fake_send)
-    monkeypatch.setattr("sip_manager.udp_receive", fake_recv)
-
-    response, latency = manager.send_request(method="INVITE")
-    assert response["status"] == 200
-    assert response["reason"] == "OK"
-    assert sent_messages, "Expected message to be sent"
-    stats = manager.get_stats("INVITE")
-    assert stats["sent"] == 1
-    assert stats["ok"] == 1
-    assert stats["timeout"] == 0
-
-
-def test_send_request_timeout(monkeypatch):
-    manager = SIPManager("198.51.100.10", timeout=0.1)
-
-    monkeypatch.setattr("sip_manager.open_udp_socket", dummy_udp_socket)
-
-    def fake_send(sock, data, addr):
-        pass
-
-    def fake_recv(sock):
-        raise socket.timeout
-
-    monkeypatch.setattr("sip_manager.udp_send", fake_send)
-    monkeypatch.setattr("sip_manager.udp_receive", fake_recv)
-
-    response, latency = manager.send_request(method="OPTIONS", retries=1)
-    assert response is None
-    stats = manager.get_stats("OPTIONS")
-    assert stats["sent"] == 1
-    assert stats["timeout"] == 1
+def test_build_options_contains_mandatory_headers():
+    call_id, payload = build_options("example.com", "10.0.0.1", 5070, "alice", 1)
+    text = payload.decode()
+    assert "OPTIONS sip:example.com SIP/2.0" in text
+    assert f"Call-ID: {call_id}" in text
+    assert "Content-Length: 0" in text
