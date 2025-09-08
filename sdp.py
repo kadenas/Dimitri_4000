@@ -2,16 +2,26 @@
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, Iterable, List, Tuple
 
 # Mapping between codec names and payload types
-PT_FROM_CODEC_NAME = {"pcmu": 0, "pcma": 8}
+PT_FROM_CODEC_NAME = {"pcmu": 0, "pcma": 8, "g729": 18}
 CODEC_NAME_FROM_PT = {v: k.upper() for k, v in PT_FROM_CODEC_NAME.items()}
 
 
-def build_sdp(local_ip: str, rtp_port: int, pts: List[int]) -> bytes:
-    """Return minimal SDP offer/answer advertising the given payload types."""
-    pt_list = " ".join(str(pt) for pt in pts)
+def build_sdp(
+    local_ip: str, rtp_port: int, codecs: Iterable[Tuple[int, str]]
+) -> bytes:
+    """Return minimal SDP offer/answer advertising the given payload types.
+
+    ``codecs`` is an iterable of ``(pt, name)`` pairs where ``pt`` is the RTP
+    payload type number and ``name`` is the codec name to advertise in the
+    ``rtpmap`` attribute. Unknown codecs can be included and will be announced
+    as provided.
+    """
+
+    codecs = list(codecs)
+    pt_list = " ".join(str(pt) for pt, _ in codecs)
     lines = [
         "v=0\r\n",
         f"o=dimitri 0 0 IN IP4 {local_ip}\r\n",
@@ -20,9 +30,8 @@ def build_sdp(local_ip: str, rtp_port: int, pts: List[int]) -> bytes:
         "t=0 0\r\n",
         f"m=audio {rtp_port} RTP/AVP {pt_list}\r\n",
     ]
-    for pt in pts:
-        codec = CODEC_NAME_FROM_PT.get(pt, str(pt))
-        lines.append(f"a=rtpmap:{pt} {codec}/8000\r\n")
+    for pt, name in codecs:
+        lines.append(f"a=rtpmap:{pt} {name}/8000\r\n")
     lines.append("a=sendrecv\r\n")
     return "".join(lines).encode()
 

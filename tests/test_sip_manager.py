@@ -5,6 +5,7 @@ import hashlib
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import pytest
+import app
 
 from sip_manager import (
     build_options,
@@ -59,19 +60,44 @@ def test_build_response_generates_basic_sip_message():
 
 
 def test_build_sdp_returns_valid_structure():
-    sdp = build_sdp("10.0.0.1", 4000, [0])
+    sdp = build_sdp("10.0.0.1", 4000, [(0, "PCMU")])
     assert b"c=IN IP4 10.0.0.1" in sdp
     assert b"m=audio 4000 RTP/AVP 0" in sdp
 
 
 def test_parse_sdp_parses_pts_and_rtpmap():
-    sdp = build_sdp("10.0.0.1", 4000, [0, 8])
+    sdp = build_sdp("10.0.0.1", 4000, [(0, "PCMU"), (8, "PCMA")])
     info = parse_sdp(sdp)
     assert info["ip"] == "10.0.0.1"
     assert info["audio_port"] == 4000
     assert info["pts"] == [0, 8]
     assert info["rtpmap"][0] == "PCMU"
     assert info["rtpmap"][8] == "PCMA"
+
+
+def test_build_sdp_handles_unknown_codec():
+    sdp = build_sdp("10.0.0.1", 4000, [(0, "PCMU"), (101, "FOO")])
+    text = sdp.decode()
+    assert "m=audio 4000 RTP/AVP 0 101" in text
+    assert "a=rtpmap:101 FOO/8000" in text
+
+
+def _run_parse_args(args_list):
+    argv = sys.argv
+    sys.argv = ["app.py"] + args_list
+    try:
+        return app.parse_args()
+    finally:
+        sys.argv = argv
+
+
+def test_allow_unsupported_codecs_flag():
+    with pytest.raises(SystemExit) as exc:
+        _run_parse_args(["--codecs", "g729"])
+    assert "Codec desconocido" in str(exc.value)
+    args = _run_parse_args(["--codecs", "g729", "--allow-unsupported-codecs"])
+    pts = [pt for pt, _ in args.codecs]
+    assert 18 in pts
 
 
 def test_build_bye_uses_dialog_fields():

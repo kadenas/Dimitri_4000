@@ -290,3 +290,20 @@ Se puede guardar el audio recibido en un WAV con `--rtp-save-wav`.
 
 Limitaciones: no hay SRTP, ICE ni cancelación de eco; la detección de NAT es
 básica.
+
+### Códecs no soportados
+
+Para pruebas se pueden anunciar códecs desconocidos (por ejemplo G.729) en la
+oferta SDP usando `--allow-unsupported-codecs`. La implementación de RTP sigue
+siendo únicamente para PCMU/PCMA; si el UAS recibe una oferta sin intersección
+con {0,8} responderá `488 Not Acceptable Here`.
+
+Ejemplo para forzar un 488 anunciando solo G.729:
+
+```bash
+python app.py --invite --dst 1.2.3.4 --codecs g729 --allow-unsupported-codecs
+```
+
+Si un UAS remoto responde `200 OK` seleccionando un códec fuera de {0,8}, el
+UAC registrará un WARNING `unsupported negotiated codec`, enviará el ACK
+obligatorio y luego un BYE inmediato sin iniciar RTP.

@@ -123,6 +123,11 @@ def parse_args():
         help="Lista de códecs permitidos/orden de preferencia",
     )
     p.add_argument(
+        "--allow-unsupported-codecs",
+        action="store_true",
+        help="Permite anunciar PTs no soportados solo en la oferta SDP",
+    )
+    p.add_argument(
         "--codec",
         choices=["pcmu", "pcma"],
         help="(compat) equivalente a --codecs <valor>",
@@ -160,15 +165,46 @@ def parse_args():
     # Handle codec options
     if args.codec:
         args.codecs = args.codec
-    codec_list = [c.strip().lower() for c in args.codecs.split(",") if c.strip()]
-    valid = set(PT_FROM_CODEC_NAME.keys())
-    for c in codec_list:
-        if c not in valid:
-            raise SystemExit(f"Codec desconocido: {c}")
-    args.codecs = codec_list
+    codec_items = [c.strip().lower() for c in args.codecs.split(",") if c.strip()]
+    codecs: list[tuple[int, str]] = []
+    codec_names: list[str] = []
+    used_pts: set[int] = set()
+    next_dyn_pt = 96
+    for item in codec_items:
+        if item.isdigit():
+            pt = int(item)
+            name = CODEC_NAME_FROM_PT.get(pt, item.upper())
+            if pt not in (0, 8) and not args.allow_unsupported_codecs:
+                raise SystemExit(
+                    f"Codec desconocido: {item} (usa --allow-unsupported-codecs para anunciarlo solo en SDP)"
+                )
+        elif item in PT_FROM_CODEC_NAME:
+            pt = PT_FROM_CODEC_NAME[item]
+            name = CODEC_NAME_FROM_PT[pt]
+            if pt not in (0, 8) and not args.allow_unsupported_codecs:
+                raise SystemExit(
+                    f"Codec desconocido: {item} (usa --allow-unsupported-codecs para anunciarlo solo en SDP)"
+                )
+        elif args.allow_unsupported_codecs:
+            while next_dyn_pt in used_pts:
+                next_dyn_pt += 1
+                if next_dyn_pt > 127:
+                    raise SystemExit("Sin PT dinámicos disponibles")
+            pt = next_dyn_pt
+            next_dyn_pt += 1
+            name = item.upper()
+        else:
+            raise SystemExit(
+                f"Codec desconocido: {item} (usa --allow-unsupported-codecs para anunciarlo solo en SDP)"
+            )
+        codecs.append((pt, name))
+        codec_names.append(item)
+        used_pts.add(pt)
+    args.codecs = codecs
+    args.codec_names = codec_names
     if args.prefer:
         args.prefer = args.prefer.lower()
-        if args.prefer not in args.codecs:
+        if args.prefer not in codec_names:
             logger.warning("--prefer %s ignorado; no está en --codecs", args.prefer)
             args.prefer = None
 
@@ -276,7 +312,9 @@ def main():
 
         local_ip = args.bind_ip or sock.getsockname()[0]
         local_port = sock.getsockname()[1]
-        local_pts = [PT_FROM_CODEC_NAME[c] for c in args.codecs]
+        local_pts = [pt for pt, _ in args.codecs if pt in (0, 8)]
+        if not local_pts:
+            local_pts = [0, 8]
         first_pt = local_pts[0]
         contact_ip = args.advertised_ip or local_ip
         user = "dimitri"
@@ -423,6 +461,10 @@ def main():
                             rip = sdp_info.get("ip")
                             rport = sdp_info.get("audio_port")
                             remote_pts = sdp_info.get("pts") or []
+                            logger.info(
+                                "Offer SDP PTs=%s; supported locally=[0,8]",
+                                remote_pts,
+                            )
                             chosen_pt = None
                             if remote_pts:
                                 common = [pt for pt in remote_pts if pt in local_pts]
@@ -668,7 +710,18 @@ def main():
                                 "Contact": f"<sip:{user}@{contact_ip}:{sock.getsockname()[1]}>",
                                 "Content-Type": "application/sdp",
                             }
-                            sdp = build_sdp(contact_ip, args.rtp_port, [dialog["pt"]])
+                            sdp = build_sdp(
+                                contact_ip,
+                                args.rtp_port,
+                                [
+                                    (
+                                        dialog["pt"],
+                                        CODEC_NAME_FROM_PT.get(
+                                            dialog["pt"], str(dialog["pt"])
+                                        ),
+                                    )
+                                ],
+                            )
                             sock.sendto(
                                 build_response(200, "OK", headers, sdp), dialog["peer_addr"]
                             )
@@ -691,7 +744,18 @@ def main():
                                     "Contact": f"<sip:{user}@{contact_ip}:{sock.getsockname()[1]}>",
                                     "Content-Type": "application/sdp",
                                 }
-                                sdp = build_sdp(contact_ip, args.rtp_port, [dialog["pt"]])
+                                sdp = build_sdp(
+                                    contact_ip,
+                                    args.rtp_port,
+                                    [
+                                        (
+                                            dialog["pt"],
+                                            CODEC_NAME_FROM_PT.get(
+                                                dialog["pt"], str(dialog["pt"])
+                                            ),
+                                        )
+                                    ],
+                                )
                                 sock.sendto(
                                     build_response(200, "OK", headers, sdp),
                                     dialog["peer_addr"],
