@@ -188,7 +188,11 @@ def main():
         events: list = []
 
         def schedule(key, typ, delay):
-            events.append({"time": time.time() + delay, "type": typ, "key": key})
+            t = time.time() + delay
+            for e in events:
+                if e["key"] == key and e["type"] == typ:
+                    return
+            events.append({"time": t, "type": typ, "key": key})
 
         def cancel_events(key, types=None):
             events[:] = [
@@ -281,7 +285,7 @@ def main():
                                 f"To: {to}\r\n"
                                 f"Call-ID: {call_id}\r\n"
                                 f"CSeq: {cseq_hdr}\r\n"
-                                f"Contact: <sip:{user}@{contact_ip_resp}>\r\n"
+                                f"Contact: <sip:{user}@{contact_ip_resp}:{sock.getsockname()[1]}>\r\n"
                                 "User-Agent: Dimitri-4000/0.1\r\n"
                                 "Allow: INVITE, ACK, CANCEL, OPTIONS, BYE\r\n"
                                 "Accept: application/sdp\r\n"
@@ -393,7 +397,9 @@ def main():
                     elif args.uas and start.startswith("ACK "):
                         try:
                             fr = headers["from"]
+                            to = headers["to"]
                             call_id = headers["call-id"]
+                            cseq_hdr = headers["cseq"]
                         except KeyError:
                             pass
                         else:
@@ -403,14 +409,22 @@ def main():
                             key = (call_id, remote_tag)
                             dialog = dialogs.get(key)
                             if dialog:
-                                if dialog.get("state") == "cancelled":
-                                    cancel_events(key)
-                                    dialogs.pop(key, None)
-                                elif dialog.get("state") == "answered":
-                                    dialog["state"] = "established"
-                                    cancel_events(key, ["200_retx", "timer_m"])
-                                    if args.uas_talk_time > 0:
-                                        schedule(key, "bye", args.uas_talk_time)
+                                local_tag = None
+                                if "tag=" in to.lower():
+                                    local_tag = to.split("tag=")[1].split(";", 1)[0]
+                                cseq_num = cseq_hdr.split()[0] if cseq_hdr else ""
+                                if (
+                                    local_tag == dialog["local_tag"]
+                                    and cseq_num == dialog["their_cseq_invite"]
+                                ):
+                                    if dialog.get("state") == "cancelled":
+                                        cancel_events(key)
+                                        dialogs.pop(key, None)
+                                    elif dialog.get("state") == "answered":
+                                        dialog["state"] = "established"
+                                        cancel_events(key, ["200_retx", "timer_m"])
+                                        if args.uas_talk_time > 0:
+                                            schedule(key, "bye", args.uas_talk_time)
                     elif args.uas and start.startswith("BYE "):
                         try:
                             via = headers["via"]
@@ -469,10 +483,13 @@ def main():
                 # ejecutar eventos programados
                 for ev in list(events):
                     if now >= ev["time"]:
+                        try:
+                            events.remove(ev)
+                        except ValueError:
+                            continue
                         key = ev["key"]
                         dialog = dialogs.get(key)
                         if not dialog:
-                            events.remove(ev)
                             continue
                         etype = ev["type"]
                         if etype == "ring":
@@ -494,7 +511,7 @@ def main():
                                 "To": f"{dialog['to_uri']};tag={dialog['local_tag']}",
                                 "Call-ID": dialog["call_id"],
                                 "CSeq": dialog["cseq_hdr"],
-                                "Contact": f"<sip:{user}@{contact_ip}>",
+                                "Contact": f"<sip:{user}@{contact_ip}:{sock.getsockname()[1]}>",
                                 "Content-Type": "application/sdp",
                             }
                             sdp = build_sdp(contact_ip, args.uas_rtp_port, args.uas_codec)
@@ -513,7 +530,7 @@ def main():
                                     "To": f"{dialog['to_uri']};tag={dialog['local_tag']}",
                                     "Call-ID": dialog["call_id"],
                                     "CSeq": dialog["cseq_hdr"],
-                                    "Contact": f"<sip:{user}@{contact_ip}>",
+                                    "Contact": f"<sip:{user}@{contact_ip}:{sock.getsockname()[1]}>",
                                     "Content-Type": "application/sdp",
                                 }
                                 sdp = build_sdp(contact_ip, args.uas_rtp_port, args.uas_codec)
@@ -534,7 +551,6 @@ def main():
                         elif etype == "del":
                             dialogs.pop(key, None)
                             cancel_events(key)
-                        events.remove(ev)
 
                 if dst and now >= next_send:
                     if args.bind_ip:
