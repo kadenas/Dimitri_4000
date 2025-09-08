@@ -507,6 +507,7 @@ class SIPManager:
         max_call_time: float = 0.0,
         codec: str = "pcmu",
         rtp_port: int = 40000,
+        rtp_port_forced: bool = False,
         rtcp: bool = False,
         tone_hz: int | None = None,
         send_silence: bool = False,
@@ -861,6 +862,7 @@ class SIPManager:
                         payload_pt,
                         symmetric=symmetric,
                         save_wav=save_wav,
+                        forced=rtp_port_forced,
                     )
                     rtp.rtcp = rtcp
                     rtp.tone_hz = tone_hz

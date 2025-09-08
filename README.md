@@ -173,6 +173,11 @@ usa el puerto origen del `200 OK`).
 Las peticiones dentro del diálogo (BYE, etc.) siguen el `Record-Route` recibido
 en el `200 OK` para construir el `Route` set.
 
+Si se ejecutan en la misma máquina un UAC y un UAS de Dimitri 4000, deben
+configurarse pares de puertos RTP distintos para evitar conflictos. Por
+ejemplo, el UAS puede anunciar 40100 (usará también 40101 para RTCP) y el UAC
+42000 (42001 para RTCP).
+
 ### Interfaz interactiva
 
 ```bash

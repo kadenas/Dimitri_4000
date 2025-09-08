@@ -6,6 +6,7 @@ import struct
 import threading
 import time
 import uuid
+import errno
 
 logger = logging.getLogger("rtp")
 
@@ -52,6 +53,7 @@ class RtpSession:
         ssrc: int | None = None,
         symmetric: bool = False,
         save_wav: str | None = None,
+        forced: bool = False,
     ) -> None:
         self.local_ip = local_ip
         self.rtp_port = rtp_port
@@ -59,6 +61,7 @@ class RtpSession:
         self.ssrc = ssrc or uuid.uuid4().int & 0xFFFFFFFF
         self.symmetric = symmetric
         self.save_wav = save_wav
+        self.port_forced = forced
         self.remote_addr = None
         self.tone_hz = None
         self.send_silence = False
@@ -78,15 +81,67 @@ class RtpSession:
         self.wav_samples = 0
 
     def start(self, remote_ip: str | None, remote_port: int | None) -> None:
-        self.rtp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.rtp_sock.bind((self.local_ip, self.rtp_port))
-        if self.rtcp:
-            self.rtcp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        base_port = self.rtp_port
+        if self.port_forced:
+            if base_port % 2 == 1:
+                raise ValueError(f"RTP port {base_port} must be even")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                self.rtcp_sock.bind((self.local_ip, self.rtp_port + 1))
-            except OSError:
-                self.rtcp_sock.close()
-                self.rtcp_sock = None
+                sock.bind((self.local_ip, base_port))
+            except OSError as e:
+                sock.close()
+                if e.errno == errno.EADDRINUSE:
+                    raise OSError(errno.EADDRINUSE, f"RTP port {base_port} already in use") from e
+                raise
+            self.rtp_sock = sock
+            if self.rtcp:
+                rtcp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                rtcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    rtcp_sock.bind((self.local_ip, base_port + 1))
+                except OSError as e:
+                    rtcp_sock.close()
+                    self.rtp_sock.close()
+                    if e.errno == errno.EADDRINUSE:
+                        raise OSError(
+                            errno.EADDRINUSE,
+                            f"RTCP port {base_port + 1} already in use",
+                        ) from e
+                    raise
+                self.rtcp_sock = rtcp_sock
+        else:
+            if base_port % 2 == 1:
+                base_port += 1
+            selected = None
+            for offset in range(0, 22, 2):
+                cand = base_port + offset
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    sock.bind((self.local_ip, cand))
+                except OSError:
+                    sock.close()
+                    continue
+                rtcp_sock = None
+                if self.rtcp:
+                    rtcp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    rtcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    try:
+                        rtcp_sock.bind((self.local_ip, cand + 1))
+                    except OSError:
+                        sock.close()
+                        rtcp_sock.close()
+                        continue
+                self.rtp_sock = sock
+                if self.rtcp:
+                    self.rtcp_sock = rtcp_sock
+                self.rtp_port = cand
+                selected = cand
+                logger.info("RTP port auto-selected %s", cand)
+                break
+            if selected is None:
+                raise OSError("No free RTP port in range")
         self.remote_addr = (
             (remote_ip, remote_port) if remote_ip and remote_port else None
         )
@@ -109,23 +164,30 @@ class RtpSession:
 
     def stop(self) -> None:
         self.running = False
-        for sock in (getattr(self, "rtp_sock", None), getattr(self, "rtcp_sock", None)):
-            if sock:
+        try:
+            for t in [
+                getattr(self, "send_thread", None),
+                getattr(self, "recv_thread", None),
+                getattr(self, "stats_thread", None),
+            ]:
+                if t:
+                    t.join(timeout=0.2)
+        finally:
+            for sock in (
+                getattr(self, "rtp_sock", None),
+                getattr(self, "rtcp_sock", None),
+            ):
+                if sock:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+            if self.wav_file:
                 try:
-                    sock.close()
-                except OSError:
-                    pass
-        for t in [
-            getattr(self, "send_thread", None),
-            getattr(self, "recv_thread", None),
-            getattr(self, "stats_thread", None),
-        ]:
-            if t:
-                t.join(timeout=0.2)
-        if self.wav_file:
-            write_wav_header(self.wav_file, self.wav_samples)
-            self.wav_file.close()
-            self.wav_file = None
+                    write_wav_header(self.wav_file, self.wav_samples)
+                finally:
+                    self.wav_file.close()
+                    self.wav_file = None
 
     def metrics(self) -> dict:
         if not self.start_time:
