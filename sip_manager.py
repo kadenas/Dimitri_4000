@@ -407,6 +407,8 @@ class SIPManager:
         cseq_start: int = 1,
         ring_timeout: float = 15.0,
         talk_time: float = 5.0,
+        wait_bye: bool = False,
+        max_call_time: float = 0.0,
         codec: str = "pcmu",
         rtp_port: int = 40000,
         rtcp: bool = False,
@@ -486,6 +488,8 @@ class SIPManager:
         setup_ms = None
         result = "timeout"
 
+        call_established = False
+        talk_start = None
         try:
             while True:
                 now = time.monotonic()
@@ -587,9 +591,6 @@ class SIPManager:
                                 port = s.getpeername()[1]
                             except OSError:
                                 port = 5060
-                            # insert the fallback port into the URI for the
-                            # request line so that the ACK targets the correct
-                            # socket.
                             if "@" in contact_uri:
                                 user_part, host_part = contact_uri.split("@", 1)
                                 if ";" in host_part:
@@ -619,6 +620,97 @@ class SIPManager:
                         contact_user,
                     )
                     s.send(ack)
+                    call_established = True
+                    talk_start = time.monotonic()
+                    if wait_bye:
+                        s.settimeout(0.5)
+                        try:
+                            while True:
+                                if (
+                                    max_call_time > 0
+                                    and time.monotonic() - talk_start >= max_call_time
+                                ):
+                                    bye = build_bye_request(
+                                        contact_uri,
+                                        to_header,
+                                        local_ip,
+                                        local_port,
+                                        from_uri,
+                                        from_display,
+                                        call_id,
+                                        cseq_start + 1,
+                                        tag,
+                                        contact_user,
+                                    )
+                                    s.send(bye)
+                                    deadline = time.monotonic() + 3
+                                    while time.monotonic() < deadline:
+                                        try:
+                                            data2 = s.recv(4096)
+                                        except socket.timeout:
+                                            continue
+                                        c2, _ = status_from_response(data2)
+                                        if c2 == 200:
+                                            logger.info("200 OK al BYE")
+                                            break
+                                    result = "max-time-bye"
+                                    break
+                                try:
+                                    data2 = s.recv(4096)
+                                except socket.timeout:
+                                    continue
+                                start2, headers2 = parse_headers(data2)
+                                if start2.startswith("BYE") and headers2.get(
+                                    "call-id"
+                                ) == call_id:
+                                    resp = build_response(
+                                        200,
+                                        "OK",
+                                        {
+                                            "Via": headers2.get("via", ""),
+                                            "From": headers2.get("from", ""),
+                                            "To": headers2.get("to", ""),
+                                            "Call-ID": headers2.get("call-id", ""),
+                                            "CSeq": headers2.get("cseq", ""),
+                                        },
+                                    )
+                                    s.send(resp)
+                                    result = "remote-bye"
+                                    break
+                                c2, _ = status_from_response(data2)
+                                if c2 == 200:
+                                    s.send(ack)
+                                    continue
+                                if start2.startswith("INVITE") or start2.startswith(
+                                    "UPDATE"
+                                ):
+                                    continue
+                        except KeyboardInterrupt:
+                            bye = build_bye_request(
+                                contact_uri,
+                                to_header,
+                                local_ip,
+                                local_port,
+                                from_uri,
+                                from_display,
+                                call_id,
+                                cseq_start + 1,
+                                tag,
+                                contact_user,
+                            )
+                            s.send(bye)
+                            deadline = time.monotonic() + 3
+                            while time.monotonic() < deadline:
+                                try:
+                                    data2 = s.recv(4096)
+                                except socket.timeout:
+                                    continue
+                                c2, _ = status_from_response(data2)
+                                if c2 == 200:
+                                    logger.info("200 OK al BYE")
+                                    break
+                            result = "aborted"
+                        break
                     if talk_time > 0:
                         time.sleep(talk_time)
                         bye = build_bye_request(
@@ -689,12 +781,41 @@ class SIPManager:
 
         except KeyboardInterrupt:
             logger.info("Llamada abortada por usuario")
+            if call_established and 'contact_uri' in locals():
+                try:
+                    bye = build_bye_request(
+                        contact_uri,
+                        to_header,
+                        local_ip,
+                        local_port,
+                        from_uri,
+                        from_display,
+                        call_id,
+                        cseq_start + 1,
+                        tag,
+                        contact_user,
+                    )
+                    s.send(bye)
+                    deadline = time.monotonic() + 3
+                    while time.monotonic() < deadline:
+                        try:
+                            data2 = s.recv(4096)
+                        except socket.timeout:
+                            continue
+                        c2, _ = status_from_response(data2)
+                        if c2 == 200:
+                            logger.info("200 OK al BYE")
+                            break
+                except OSError:
+                    pass
             result = "aborted"
-            raise
         finally:
             s.close()
             if 'rtp' in locals():
                 rtp.stop()
 
-        talk_s = talk_time if result == "answered" else 0
+        if talk_start:
+            talk_s = time.monotonic() - talk_start
+        else:
+            talk_s = 0
         return call_id, result, setup_ms or 0, talk_s

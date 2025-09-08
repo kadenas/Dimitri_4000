@@ -111,6 +111,17 @@ def parse_args():
     p.add_argument("--use-pai-asserted", action="store_true", help="Añadir P-Asserted-Identity")
     p.add_argument("--ring-timeout", type=float, default=15.0, help="Tiempo de espera antes de cancelar")
     p.add_argument("--talk-time", type=float, default=5.0, help="Tiempo de conversación antes de enviar BYE")
+    p.add_argument(
+        "--wait-bye",
+        action="store_true",
+        help="Si está, tras 200/ACK el UAC espera BYE remoto",
+    )
+    p.add_argument(
+        "--max-call-time",
+        type=float,
+        default=0.0,
+        help="Segundos; si se supera sin BYE, enviar BYE y cerrar (0=infinito)",
+    )
     p.add_argument("--codec", choices=["pcmu", "pcma"], default="pcmu", help="Codec SDP")
     p.add_argument("--rtp-port", type=int, default=40000, help="Puerto RTP local")
     p.add_argument("--rtcp", action="store_true", help="Abrir puerto RTCP")
@@ -180,6 +191,8 @@ def main():
                 cseq_start=args.cseq_start,
                 ring_timeout=args.ring_timeout,
                 talk_time=args.talk_time,
+                wait_bye=args.wait_bye,
+                max_call_time=args.max_call_time,
                 codec=args.codec,
                 rtp_port=args.rtp_port,
                 rtcp=args.rtcp,
