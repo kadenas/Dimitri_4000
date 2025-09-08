@@ -3,6 +3,8 @@ import re
 import socket
 import time
 import uuid
+import hashlib
+import secrets
 from typing import Tuple
 from rtp import RtpSession
 
@@ -32,6 +34,55 @@ def status_from_response(data: bytes):
         return code, reason
     except Exception:
         return None, ""
+
+
+def parse_auth(challenge: str) -> dict:
+    """Parse a WWW-/Proxy-Authenticate header with Digest scheme."""
+    result: dict[str, str] = {}
+    if not challenge or not challenge.lower().startswith("digest"):
+        return result
+    params = challenge[len("Digest"):].split(",")
+    for p in params:
+        if "=" in p:
+            k, v = p.strip().split("=", 1)
+            v = v.strip().strip('"')
+            result[k.lower()] = v
+    return result
+
+
+def build_digest_auth(
+    method: str,
+    uri: str,
+    user: str,
+    password: str,
+    realm: str,
+    nonce: str,
+    qop: str,
+    cnonce: str,
+    nc: int,
+    alg: str = "MD5",
+    opaque: str | None = None,
+) -> str:
+    """Return the value for Authorization/Proxy-Authorization (Digest)."""
+    ha1 = hashlib.md5(f"{user}:{realm}:{password}".encode()).hexdigest()
+    ha2 = hashlib.md5(f"{method}:{uri}".encode()).hexdigest()
+    resp = hashlib.md5(
+        f"{ha1}:{nonce}:{nc:08x}:{cnonce}:{qop}:{ha2}".encode()
+    ).hexdigest()
+    parts = [
+        f'username="{user}"',
+        f'realm="{realm}"',
+        f'nonce="{nonce}"',
+        f'uri="{uri}"',
+        f'response="{resp}"',
+        "algorithm=MD5",
+        f'cnonce="{cnonce}"',
+        f'nc={nc:08x}',
+        f'qop={qop}',
+    ]
+    if opaque:
+        parts.append(f'opaque="{opaque}"')
+    return "Digest " + ", ".join(parts)
 
 
 def build_options(
@@ -74,6 +125,7 @@ def build_invite(
     pai: str | None = None,
     use_pai: bool = False,
     use_pai_asserted: bool = False,
+    auth_header: tuple[str, str] | None = None,
 ) -> bytes:
     sent_by = f"{local_ip}:{local_port}"
     content_length = len(sdp.encode())
@@ -96,6 +148,8 @@ def build_invite(
         msg += f"P-Preferred-Identity: <{pai}>\r\n"
     if use_pai_asserted and pai:
         msg += f"P-Asserted-Identity: <{pai}>\r\n"
+    if auth_header:
+        msg += f"{auth_header[0]}: {auth_header[1]}\r\n"
     msg += (
         "Content-Type: application/sdp\r\n"
         f"Content-Length: {content_length}\r\n\r\n"
@@ -180,6 +234,7 @@ def build_bye_request(
     cseq: int,
     tag: str,
     contact_user: str,
+    auth_header: tuple[str, str] | None = None,
 ) -> bytes:
     """Build a BYE request for the caller side (UAC)."""
     branch = "z9hG4bK" + uuid.uuid4().hex
@@ -197,8 +252,10 @@ def build_bye_request(
         f"CSeq: {cseq} BYE\r\n"
         f"Contact: <sip:{contact_user}@{local_ip}:{local_port}>\r\n"
         "User-Agent: Dimitri-4000/0.1\r\n"
-        "Content-Length: 0\r\n\r\n"
     )
+    if auth_header:
+        msg += f"{auth_header[0]}: {auth_header[1]}\r\n"
+    msg += "Content-Length: 0\r\n\r\n"
     return msg.encode()
 
 
@@ -401,6 +458,10 @@ class SIPManager:
         pai: str | None = None,
         use_pai: bool = False,
         use_pai_asserted: bool = False,
+        auth_user: str | None = None,
+        auth_pass: str | None = None,
+        auth_realm: str | None = None,
+        auth_username: str | None = None,
         bind_ip: str | None = None,
         bind_port: int = 0,
         timeout: float = 2.0,
@@ -449,6 +510,9 @@ class SIPManager:
             request_uri = make_uri(to_user, dst_host)
 
         contact_user = from_user
+        invite_cseq = cseq_start
+        auth_username = auth_username or auth_user or from_user
+        auth_state = {"nc": 0, "realm": auth_realm, "nonce": None, "opaque": None, "qop": "auth", "proxy": False}
 
         call_id = str(uuid.uuid4())
         branch = "z9hG4bK" + uuid.uuid4().hex
@@ -462,7 +526,7 @@ class SIPManager:
             local_ip,
             local_port,
             call_id,
-            cseq_start,
+            invite_cseq,
             tag,
             branch,
             sdp,
@@ -474,7 +538,7 @@ class SIPManager:
         )
 
         logger.info(
-            f"Enviando INVITE (CSeq={cseq_start}) a {dst_host}:{dst_port} sent-by={local_ip}:{local_port}"
+            f"Enviando INVITE (CSeq={invite_cseq}) a {dst_host}:{dst_port} sent-by={local_ip}:{local_port}"
         )
         s.send(invite)
         t_start = time.monotonic()
@@ -485,6 +549,109 @@ class SIPManager:
         cancel_deadline = None
         contact_uri = request_uri
         to_header = f"<{to_uri}>"
+        
+        def send_bye(cseq: int) -> int:
+            nonlocal to_header
+            auth_hdr = None
+            if auth_user and auth_pass and auth_state.get("nonce"):
+                cnonce = secrets.token_hex(8)
+                auth_state["nc"] = auth_state.get("nc", 0) + 1
+                auth_val = build_digest_auth(
+                    "BYE",
+                    contact_uri,
+                    auth_username,
+                    auth_pass,
+                    auth_state["realm"],
+                    auth_state["nonce"],
+                    auth_state.get("qop", "auth"),
+                    cnonce,
+                    auth_state["nc"],
+                    opaque=auth_state.get("opaque"),
+                )
+                hdr_name = "Proxy-Authorization" if auth_state.get("proxy") else "Authorization"
+                auth_hdr = (hdr_name, auth_val)
+            bye = build_bye_request(
+                contact_uri,
+                to_header,
+                local_ip,
+                local_port,
+                from_uri,
+                from_display,
+                call_id,
+                cseq,
+                tag,
+                contact_user,
+                auth_header=auth_hdr,
+            )
+            s.send(bye)
+            while True:
+                try:
+                    data2 = s.recv(4096)
+                except socket.timeout:
+                    return cseq
+                start2, headers2 = parse_headers(data2)
+                c2, _ = status_from_response(data2)
+                if c2 in (401, 407) and auth_user and auth_pass and not auth_state.get("bye_auth_done"):
+                    chall = headers2.get("www-authenticate" if c2 == 401 else "proxy-authenticate")
+                    if chall:
+                        params = parse_auth(chall)
+                        realm = auth_realm or params.get("realm", "")
+                        nonce = params.get("nonce", "")
+                        opaque = params.get("opaque")
+                        qop = params.get("qop", "auth")
+                        auth_state.update({"realm": realm, "nonce": nonce, "opaque": opaque, "qop": qop, "proxy": c2 == 407})
+                        to_hdr = headers2.get("to", to_header)
+                        to_header = to_hdr
+                        ack = build_ack(
+                            contact_uri,
+                            to_hdr,
+                            local_ip,
+                            local_port,
+                            from_uri,
+                            from_display,
+                            call_id,
+                            cseq,
+                            tag,
+                            contact_user,
+                        )
+                        s.send(ack)
+                        cseq += 1
+                        cnonce = secrets.token_hex(8)
+                        auth_state["nc"] = auth_state.get("nc", 0) + 1
+                        auth_val = build_digest_auth(
+                            "BYE",
+                            contact_uri,
+                            auth_username,
+                            auth_pass,
+                            realm,
+                            nonce,
+                            qop,
+                            cnonce,
+                            auth_state["nc"],
+                            opaque=opaque,
+                        )
+                        hdr_name = "Proxy-Authorization" if c2 == 407 else "Authorization"
+                        bye = build_bye_request(
+                            contact_uri,
+                            to_hdr,
+                            local_ip,
+                            local_port,
+                            from_uri,
+                            from_display,
+                            call_id,
+                            cseq,
+                            tag,
+                            contact_user,
+                            auth_header=(hdr_name, auth_val),
+                        )
+                        s.send(bye)
+                        auth_state["bye_auth_done"] = True
+                        continue
+                if c2 == 200:
+                    logger.info("200 OK al BYE")
+                    break
+            return cseq
+
         setup_ms = None
         result = "timeout"
 
@@ -502,7 +669,7 @@ class SIPManager:
                         from_uri,
                         from_display,
                         call_id,
-                        cseq_start,
+                        invite_cseq,
                         tag,
                         branch,
                         contact_user,
@@ -544,7 +711,7 @@ class SIPManager:
                             from_uri,
                             from_display,
                             call_id,
-                            cseq_start,
+                            invite_cseq,
                             tag,
                             contact_user,
                         )
@@ -557,6 +724,74 @@ class SIPManager:
                 if code in (100, 180, 183):
                     logger.info(f"Recibido {code} {reason}")
                     continue
+
+                if code in (401, 407) and auth_user and auth_pass and not auth_state.get("invite_auth_done"):
+                    header_name = "www-authenticate" if code == 401 else "proxy-authenticate"
+                    challenge = headers.get(header_name)
+                    if challenge:
+                        params = parse_auth(challenge)
+                        realm = auth_realm or params.get("realm", "")
+                        nonce = params.get("nonce", "")
+                        opaque = params.get("opaque")
+                        qop = params.get("qop", "auth")
+                        auth_state.update({"realm": realm, "nonce": nonce, "opaque": opaque, "qop": qop, "proxy": code == 407})
+                        to_header = headers.get("to", to_header)
+                        ack = build_ack(
+                            request_uri,
+                            to_header,
+                            local_ip,
+                            local_port,
+                            from_uri,
+                            from_display,
+                            call_id,
+                            invite_cseq,
+                            tag,
+                            contact_user,
+                        )
+                        s.send(ack)
+                        invite_cseq += 1
+                        cnonce = secrets.token_hex(8)
+                        auth_state["nc"] = auth_state.get("nc", 0) + 1
+                        auth_val = build_digest_auth(
+                            "INVITE",
+                            request_uri,
+                            auth_username,
+                            auth_pass,
+                            realm,
+                            nonce,
+                            qop,
+                            cnonce,
+                            auth_state["nc"],
+                            opaque=opaque,
+                        )
+                        hdr_name = "Proxy-Authorization" if code == 407 else "Authorization"
+                        branch = "z9hG4bK" + uuid.uuid4().hex
+                        invite = build_invite(
+                            request_uri,
+                            from_uri,
+                            to_uri,
+                            local_ip,
+                            local_port,
+                            call_id,
+                            invite_cseq,
+                            tag,
+                            branch,
+                            sdp,
+                            from_display=from_display,
+                            contact_user=contact_user,
+                            pai=pai,
+                            use_pai=use_pai,
+                            use_pai_asserted=use_pai_asserted,
+                            auth_header=(hdr_name, auth_val),
+                        )
+                        logger.info("Reenviando INVITE con autenticacion Digest")
+                        s.send(invite)
+                        t_start = time.monotonic()
+                        t1 = 0.5
+                        next_resend = t_start + t1
+                        ring_deadline = t_start + ring_timeout
+                        auth_state["invite_auth_done"] = True
+                        continue
 
                 if code == 200:
                     setup_ms = int((time.monotonic() - t_start) * 1000)
@@ -615,7 +850,7 @@ class SIPManager:
                         from_uri,
                         from_display,
                         call_id,
-                        cseq_start,
+                        invite_cseq,
                         tag,
                         contact_user,
                     )
@@ -630,29 +865,7 @@ class SIPManager:
                                     max_call_time > 0
                                     and time.monotonic() - talk_start >= max_call_time
                                 ):
-                                    bye = build_bye_request(
-                                        contact_uri,
-                                        to_header,
-                                        local_ip,
-                                        local_port,
-                                        from_uri,
-                                        from_display,
-                                        call_id,
-                                        cseq_start + 1,
-                                        tag,
-                                        contact_user,
-                                    )
-                                    s.send(bye)
-                                    deadline = time.monotonic() + 3
-                                    while time.monotonic() < deadline:
-                                        try:
-                                            data2 = s.recv(4096)
-                                        except socket.timeout:
-                                            continue
-                                        c2, _ = status_from_response(data2)
-                                        if c2 == 200:
-                                            logger.info("200 OK al BYE")
-                                            break
+                                    invite_cseq = send_bye(invite_cseq + 1)
                                     result = "max-time-bye"
                                     break
                                 try:
@@ -686,55 +899,12 @@ class SIPManager:
                                 ):
                                     continue
                         except KeyboardInterrupt:
-                            bye = build_bye_request(
-                                contact_uri,
-                                to_header,
-                                local_ip,
-                                local_port,
-                                from_uri,
-                                from_display,
-                                call_id,
-                                cseq_start + 1,
-                                tag,
-                                contact_user,
-                            )
-                            s.send(bye)
-                            deadline = time.monotonic() + 3
-                            while time.monotonic() < deadline:
-                                try:
-                                    data2 = s.recv(4096)
-                                except socket.timeout:
-                                    continue
-                                c2, _ = status_from_response(data2)
-                                if c2 == 200:
-                                    logger.info("200 OK al BYE")
-                                    break
+                            invite_cseq = send_bye(invite_cseq + 1)
                             result = "aborted"
                         break
                     if talk_time > 0:
                         time.sleep(talk_time)
-                        bye = build_bye_request(
-                            contact_uri,
-                            to_header,
-                            local_ip,
-                            local_port,
-                            from_uri,
-                            from_display,
-                            call_id,
-                            cseq_start + 1,
-                            tag,
-                            contact_user,
-                        )
-                        s.send(bye)
-                        while True:
-                            try:
-                                data2 = s.recv(4096)
-                            except socket.timeout:
-                                break
-                            c2, _ = status_from_response(data2)
-                            if c2 == 200:
-                                logger.info("200 OK al BYE")
-                                break
+                        invite_cseq = send_bye(invite_cseq + 1)
                     result = "answered"
                     break
 
@@ -748,7 +918,7 @@ class SIPManager:
                         from_uri,
                         from_display,
                         call_id,
-                        cseq_start,
+                        invite_cseq,
                         tag,
                         contact_user,
                     )
@@ -767,7 +937,7 @@ class SIPManager:
                         from_uri,
                         from_display,
                         call_id,
-                        cseq_start,
+                        invite_cseq,
                         tag,
                         contact_user,
                     )
@@ -783,29 +953,7 @@ class SIPManager:
             logger.info("Llamada abortada por usuario")
             if call_established and 'contact_uri' in locals():
                 try:
-                    bye = build_bye_request(
-                        contact_uri,
-                        to_header,
-                        local_ip,
-                        local_port,
-                        from_uri,
-                        from_display,
-                        call_id,
-                        cseq_start + 1,
-                        tag,
-                        contact_user,
-                    )
-                    s.send(bye)
-                    deadline = time.monotonic() + 3
-                    while time.monotonic() < deadline:
-                        try:
-                            data2 = s.recv(4096)
-                        except socket.timeout:
-                            continue
-                        c2, _ = status_from_response(data2)
-                        if c2 == 200:
-                            logger.info("200 OK al BYE")
-                            break
+                    invite_cseq = send_bye(invite_cseq + 1)
                 except OSError:
                     pass
             result = "aborted"

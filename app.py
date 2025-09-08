@@ -135,6 +135,13 @@ def parse_args():
         default=2.0,
         help="Segundos entre logs de métricas RTP",
     )
+    p.add_argument("--auth-user", help="Usuario para autenticación Digest")
+    p.add_argument("--auth-pass", help="Contraseña para autenticación Digest")
+    p.add_argument("--auth-realm", help="Realm para autenticación Digest")
+    p.add_argument(
+        "--auth-username",
+        help="Username para Digest si distinto del número de usuario",
+    )
     # Compatibilidad con la CLI antigua: host [port]
     p.add_argument("host", nargs="?", help="Destino (compat)")
     p.add_argument("port", nargs="?", type=int, help="Puerto destino (compat)")
@@ -185,6 +192,10 @@ def main():
                 pai=args.pai,
                 use_pai=args.use_pai,
                 use_pai_asserted=args.use_pai_asserted,
+                auth_user=args.auth_user,
+                auth_pass=args.auth_pass,
+                auth_realm=args.auth_realm,
+                auth_username=args.auth_username,
                 bind_ip=args.bind_ip,
                 bind_port=args.src_port,
                 timeout=args.timeout,

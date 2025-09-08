@@ -165,7 +165,7 @@ Ejemplo 2: UAS con timbres y BYE automático tras 10 s:
 python app.py --uas --uas-ring-delay 1 --uas-answer-after 3 --uas-talk-time 10 --bind-ip 10.1.64.18 --src-port 5062
 ```
 
-Limitaciones: no soporta autenticación, PRACK ni Record-Route.
+Limitaciones: no soporta PRACK ni Record-Route.
 
 El `Contact` del `200 OK` incluye siempre el puerto local real. El cliente
 envía el `ACK` al host:puerto indicado en ese `Contact` (si no trae puerto, se
@@ -198,6 +198,12 @@ Llamada completa y colgar a los 5 s:
 python app.py --invite --to sip:10.1.72.188 --dst 10.1.72.188 --dst-port 5060 --src-port 5062 --talk-time 5 --ring-timeout 15
 ```
 
+Autenticación Digest básica:
+
+```bash
+python app.py --invite --to sip:10.1.72.188 --dst 10.1.72.188 --auth-user 1000 --auth-pass secret
+```
+
 Intento con CANCEL por no respuesta:
 
 ```bash
@@ -226,7 +232,7 @@ por las respuestas finales. Si llega `487 Request Terminated` se responde con
 `ACK` y la llamada termina con `result=canceled`. Si no llega nada en ese plazo,
 se finaliza con `result=canceled-timeout`.
 
-Limitaciones actuales: no soporta autenticación, PRACK ni manejo de SDP
+Limitaciones actuales: no soporta PRACK ni manejo de SDP
 de respuesta.
 
 ### Monitorización desde script

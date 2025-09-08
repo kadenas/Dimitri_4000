@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import hashlib
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -15,6 +16,8 @@ from sip_manager import (
     normalize_number,
     make_uri,
     build_invite,
+    parse_auth,
+    build_digest_auth,
 )
 
 
@@ -109,3 +112,32 @@ def test_build_invite_includes_pai_and_display():
     assert 'To: <sip:+2000@b.com>' in text
     assert 'P-Preferred-Identity: <sip:+1000@c.com>' in text
     assert 'P-Asserted-Identity: <sip:+1000@c.com>' in text
+
+
+def test_parse_auth_and_build_digest_auth():
+    ch = 'Digest realm="test", nonce="abc", algorithm=MD5, qop="auth", opaque="xyz"'
+    params = parse_auth(ch)
+    assert params["realm"] == "test"
+    assert params["nonce"] == "abc"
+    assert params["algorithm"].upper() == "MD5"
+    assert params["qop"] == "auth"
+    assert params["opaque"] == "xyz"
+    expected_resp = hashlib.md5(
+        (
+            hashlib.md5("u:test:pass".encode()).hexdigest()
+            + ":abc:00000001:deadbeef:auth:" + hashlib.md5("INVITE:sip:x".encode()).hexdigest()
+        ).encode()
+    ).hexdigest()
+    auth_val = build_digest_auth(
+        "INVITE",
+        "sip:x",
+        "u",
+        "pass",
+        "test",
+        "abc",
+        "auth",
+        "deadbeef",
+        1,
+        opaque="xyz",
+    )
+    assert f'response="{expected_resp}"' in auth_val
