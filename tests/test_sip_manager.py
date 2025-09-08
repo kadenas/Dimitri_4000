@@ -54,7 +54,7 @@ def test_build_response_generates_basic_sip_message():
 
 
 def test_build_sdp_returns_valid_structure():
-    sdp = build_sdp("10.0.0.1", 4000, "pcmu")
+    sdp = build_sdp("10.0.0.1", 4000, 0)
     assert "c=IN IP4 10.0.0.1" in sdp
     assert "m=audio 4000 RTP/AVP" in sdp
 

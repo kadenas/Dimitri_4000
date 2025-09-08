@@ -1,19 +1,34 @@
-"""Helpers for SDP generation."""
+"""Helpers for SDP generation and parsing."""
 
-def build_sdp(local_ip: str, rtp_port: int, codec: str) -> str:
-    """Return a minimal SDP offer for a single audio stream."""
-    codec = codec.lower()
-    if codec not in {"pcmu", "pcma"}:
-        codec = "pcmu"
-    pt = 0 if codec == "pcmu" else 8
-    sdp = (
+
+def build_sdp(local_ip: str, rtp_port: int, pt: int) -> str:
+    codec = "PCMU" if pt == 0 else "PCMA"
+    return (
         "v=0\r\n"
         f"o=dimitri 0 0 IN IP4 {local_ip}\r\n"
         "s=Dimitri-4000\r\n"
         f"c=IN IP4 {local_ip}\r\n"
         "t=0 0\r\n"
         f"m=audio {rtp_port} RTP/AVP {pt}\r\n"
-        f"a=rtpmap:{pt} {codec.upper()}/8000\r\n"
+        f"a=rtpmap:{pt} {codec}/8000\r\n"
+        "a=sendrecv\r\n"
     )
-    return sdp
+
+
+def parse_sdp(text: str) -> tuple[str | None, int | None, int | None]:
+    ip = port = pt = None
+    for line in text.splitlines():
+        if line.startswith("c=") and ip is None:
+            parts = line.split()
+            if len(parts) >= 3:
+                ip = parts[2]
+        elif line.startswith("m=audio") and port is None:
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    port = int(parts[1])
+                    pt = int(parts[3])
+                except ValueError:
+                    pass
+    return ip, port, pt
 
