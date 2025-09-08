@@ -167,6 +167,10 @@ python app.py --uas --uas-ring-delay 1 --uas-answer-after 3 --uas-talk-time 10 -
 
 Limitaciones: no soporta autenticación, PRACK ni Record-Route.
 
+El `Contact` del `200 OK` incluye siempre el puerto local real. El cliente
+envía el `ACK` al host:puerto indicado en ese `Contact` (si no trae puerto, se
+usa el puerto origen del `200 OK`).
+
 ### Interfaz interactiva
 
 ```bash

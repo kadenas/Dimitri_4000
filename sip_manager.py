@@ -156,7 +156,12 @@ def build_bye_request(
     return msg.encode()
 
 
-def _contact_uri_host_port(contact: str) -> Tuple[str, str, int]:
+def _contact_uri_host_port(contact: str) -> Tuple[str, str, int | None]:
+    """Return (uri, host, port) extracted from a Contact header.
+
+    If the URI lacks an explicit port, ``port`` is ``None`` so that the caller
+    can decide the appropriate default (e.g. the source port of the response).
+    """
     uri = contact
     if "<" in contact and ">" in contact:
         uri = contact.split("<", 1)[1].split(">", 1)[0]
@@ -166,9 +171,9 @@ def _contact_uri_host_port(contact: str) -> Tuple[str, str, int]:
         try:
             port = int(port_s)
         except ValueError:
-            port = 5060
+            port = None
     else:
-        host, port = hostport, 5060
+        host, port = hostport, None
     return uri, host, port
 
 
@@ -441,6 +446,26 @@ class SIPManager:
                     contact = headers.get("contact")
                     if contact:
                         contact_uri, host, port = _contact_uri_host_port(contact)
+                        if port is None:
+                            try:
+                                port = s.getpeername()[1]
+                            except OSError:
+                                port = 5060
+                            # insert the fallback port into the URI for the
+                            # request line so that the ACK targets the correct
+                            # socket.
+                            if "@" in contact_uri:
+                                user_part, host_part = contact_uri.split("@", 1)
+                                if ";" in host_part:
+                                    host_only, params = host_part.split(";", 1)
+                                    contact_uri = (
+                                        f"{user_part}@{host_only}:{port};{params}"
+                                    )
+                                else:
+                                    contact_uri = f"{user_part}@{host_part}:{port}"
+                            elif contact_uri.startswith("sip:"):
+                                host_only = contact_uri[4:]
+                                contact_uri = f"sip:{host_only}:{port}"
                         try:
                             s.connect((host, port))
                         except OSError:
