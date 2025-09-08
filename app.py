@@ -5,6 +5,8 @@ import select
 import socket
 import time
 import uuid
+import sys
+import errno
 from datetime import datetime, UTC
 
 # logging básico por si no existe logging_conf en tu repo
@@ -145,7 +147,9 @@ def parse_args():
     # Compatibilidad con la CLI antigua: host [port]
     p.add_argument("host", nargs="?", help="Destino (compat)")
     p.add_argument("port", nargs="?", type=int, help="Puerto destino (compat)")
-    return p.parse_args()
+    args = p.parse_args()
+    args.rtp_port_forced = any(a.startswith("--rtp-port") for a in sys.argv[1:])
+    return args
 
 
 def main():
@@ -206,6 +210,7 @@ def main():
                 max_call_time=args.max_call_time,
                 codec=args.codec,
                 rtp_port=args.rtp_port,
+                rtp_port_forced=args.rtp_port_forced,
                 rtcp=args.rtcp,
                 tone_hz=args.rtp_tone,
                 send_silence=args.rtp_send_silence,
@@ -216,9 +221,14 @@ def main():
         except KeyboardInterrupt:
             raise SystemExit(130)
         except OSError as e:
-            logger.error(
-                f"No se pudo bindear UDP en {args.bind_ip or '0.0.0.0'}:{args.src_port}: {e}"
-            )
+            if e.errno == errno.EADDRINUSE:
+                logger.error(
+                    f"No se pudo bindear UDP en {args.bind_ip or '0.0.0.0'}:{args.src_port}: {e}"
+                )
+            else:
+                logger.error(
+                    f"Error de red enviando/recibiendo UDP hacia {dst}:{dport}: {e}"
+                )
             raise SystemExit(1)
         ts = datetime.now(UTC).isoformat()
         header = ["ts_iso", "call_id", "to", "result", "setup_ms", "talk_s"]
@@ -503,6 +513,7 @@ def main():
                                             pt_use,
                                             symmetric=args.symmetric_rtp,
                                             save_wav=args.rtp_save_wav,
+                                            forced=args.rtp_port_forced,
                                         )
                                         rtp.rtcp = args.rtcp
                                         rtp.tone_hz = args.rtp_tone
