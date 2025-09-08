@@ -253,6 +253,10 @@ class RtpSession:
                 continue
             seq = struct.unpack("!H", data[2:4])[0]
             ts = struct.unpack("!I", data[4:8])[0]
+            pt = data[1] & 0x7F
+            if pt not in (0, 8):
+                logger.warning("Unsupported PT=%s", pt)
+                continue
             payload = data[12:]
             arrival = time.time()
             self.recv_packets += 1
@@ -272,7 +276,7 @@ class RtpSession:
             if self.wav_file and payload:
                 pcm = (
                     ulaw_decode_to_pcm16(payload)
-                    if self.pt == 0
+                    if pt == 0
                     else alaw_decode_to_pcm16(payload)
                 )
                 try:

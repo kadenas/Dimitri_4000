@@ -7,6 +7,7 @@ import hashlib
 import secrets
 from typing import Tuple
 from rtp import RtpSession
+from sdp import build_sdp, parse_sdp, PT_FROM_CODEC_NAME, CODEC_NAME_FROM_PT
 
 logger = logging.getLogger("socket_handler")
 
@@ -334,43 +335,6 @@ def build_response(
         lines.append("Content-Length: 0\r\n\r\n")
         return "".join(lines).encode()
 
-
-def build_sdp(local_ip: str, rtp_port: int, pt: int) -> str:
-    """Return a minimal SDP offer/answer for a single codec."""
-    codec = "PCMU" if pt == 0 else "PCMA"
-    return (
-        "v=0\r\n"
-        f"o=dimitri 0 0 IN IP4 {local_ip}\r\n"
-        "s=Dimitri-4000\r\n"
-        f"c=IN IP4 {local_ip}\r\n"
-        "t=0 0\r\n"
-        f"m=audio {rtp_port} RTP/AVP {pt}\r\n"
-        f"a=rtpmap:{pt} {codec}/8000\r\n"
-        "a=sendrecv\r\n"
-    )
-
-
-def parse_sdp(text: str) -> tuple[str | None, int | None, int | None]:
-    """Extract connection IP, port and PT from SDP."""
-    ip = None
-    port = None
-    pt = None
-    for line in text.splitlines():
-        if line.startswith("c=") and ip is None:
-            parts = line.split()
-            if len(parts) >= 3:
-                ip = parts[2]
-        elif line.startswith("m=audio") and port is None:
-            parts = line.split()
-            if len(parts) >= 4:
-                try:
-                    port = int(parts[1])
-                    pt = int(parts[3])
-                except ValueError:
-                    pass
-    return ip, port, pt
-
-
 def build_bye(dialog: dict) -> bytes:
     """Build a BYE request from stored dialog information (UAS side)."""
     branch = "z9hG4bK" + uuid.uuid4().hex
@@ -505,7 +469,7 @@ class SIPManager:
         talk_time: float = 5.0,
         wait_bye: bool = False,
         max_call_time: float = 0.0,
-        codec: str = "pcmu",
+        codecs: list[str] | None = None,
         rtp_port: int = 40000,
         rtp_port_forced: bool = False,
         rtcp: bool = False,
@@ -553,8 +517,10 @@ class SIPManager:
         call_id = str(uuid.uuid4())
         branch = "z9hG4bK" + uuid.uuid4().hex
         tag = uuid.uuid4().hex[:8]
-        pt = 0 if codec.lower() == "pcmu" else 8
-        sdp = build_sdp(local_ip, rtp_port, pt)
+        codecs = codecs or ["pcmu", "pcma"]
+        pt_list = [PT_FROM_CODEC_NAME[c.lower()] for c in codecs]
+        sdp_bytes = build_sdp(local_ip, rtp_port, pt_list)
+        sdp_str = sdp_bytes.decode()
         invite = build_invite(
             request_uri,
             from_uri,
@@ -565,7 +531,7 @@ class SIPManager:
             invite_cseq,
             tag,
             branch,
-            sdp,
+            sdp_str,
             from_display=from_display,
             contact_user=contact_user,
             pai=pai,
@@ -828,7 +794,7 @@ class SIPManager:
                             invite_cseq,
                             tag,
                             branch,
-                            sdp,
+                            sdp_str,
                             from_display=from_display,
                             contact_user=contact_user,
                             pai=pai,
@@ -852,10 +818,17 @@ class SIPManager:
                     body = b""
                     if b"\r\n\r\n" in data:
                         body = data.split(b"\r\n\r\n", 1)[1]
-                    rip, rport, rpt = parse_sdp(body.decode(errors="ignore"))
-                    remote_ip = rip or dst_host
-                    remote_port = rport or rtp_port
-                    payload_pt = rpt if rpt is not None else pt
+                    sdp_info = parse_sdp(body)
+                    remote_ip = sdp_info.get("ip") or dst_host
+                    remote_port = sdp_info.get("audio_port") or rtp_port
+                    pts = sdp_info.get("pts") or []
+                    payload_pt = pts[0] if pts else pt_list[0]
+                    codec_name = sdp_info.get("rtpmap", {}).get(
+                        payload_pt, CODEC_NAME_FROM_PT.get(payload_pt, str(payload_pt))
+                    )
+                    logger.info(
+                        f"Negotiated codec: {codec_name} (PT={payload_pt})"
+                    )
                     rtp = RtpSession(
                         local_ip,
                         rtp_port,

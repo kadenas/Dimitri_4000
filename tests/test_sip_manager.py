@@ -9,7 +9,6 @@ import pytest
 from sip_manager import (
     build_options,
     build_response,
-    build_sdp,
     build_bye,
     build_bye_request,
     parse_headers,
@@ -21,6 +20,7 @@ from sip_manager import (
     build_digest_auth,
     _route_set_from_record_route,
 )
+from sdp import build_sdp, parse_sdp
 
 
 def test_status_from_response_parses_code_and_reason():
@@ -59,9 +59,19 @@ def test_build_response_generates_basic_sip_message():
 
 
 def test_build_sdp_returns_valid_structure():
-    sdp = build_sdp("10.0.0.1", 4000, 0)
-    assert "c=IN IP4 10.0.0.1" in sdp
-    assert "m=audio 4000 RTP/AVP" in sdp
+    sdp = build_sdp("10.0.0.1", 4000, [0])
+    assert b"c=IN IP4 10.0.0.1" in sdp
+    assert b"m=audio 4000 RTP/AVP 0" in sdp
+
+
+def test_parse_sdp_parses_pts_and_rtpmap():
+    sdp = build_sdp("10.0.0.1", 4000, [0, 8])
+    info = parse_sdp(sdp)
+    assert info["ip"] == "10.0.0.1"
+    assert info["audio_port"] == 4000
+    assert info["pts"] == [0, 8]
+    assert info["rtpmap"][0] == "PCMU"
+    assert info["rtpmap"][8] == "PCMA"
 
 
 def test_build_bye_uses_dialog_fields():
