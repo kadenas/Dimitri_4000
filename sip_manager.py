@@ -7,7 +7,7 @@ import hashlib
 import secrets
 from typing import Tuple
 from rtp import RtpSession
-from sdp import build_sdp, parse_sdp, PT_FROM_CODEC_NAME, CODEC_NAME_FROM_PT
+from sdp import build_sdp, parse_sdp, CODEC_NAME_FROM_PT
 
 logger = logging.getLogger("socket_handler")
 
@@ -469,7 +469,7 @@ class SIPManager:
         talk_time: float = 5.0,
         wait_bye: bool = False,
         max_call_time: float = 0.0,
-        codecs: list[str] | None = None,
+        codecs: list[tuple[int, str]] | None = None,
         rtp_port: int = 40000,
         rtp_port_forced: bool = False,
         rtcp: bool = False,
@@ -517,9 +517,10 @@ class SIPManager:
         call_id = str(uuid.uuid4())
         branch = "z9hG4bK" + uuid.uuid4().hex
         tag = uuid.uuid4().hex[:8]
-        codecs = codecs or ["pcmu", "pcma"]
-        pt_list = [PT_FROM_CODEC_NAME[c.lower()] for c in codecs]
-        sdp_bytes = build_sdp(local_ip, rtp_port, pt_list)
+        codecs = codecs or [(0, "PCMU"), (8, "PCMA")]
+        pt_list = [pt for pt, _ in codecs]
+        sdp_bytes = build_sdp(local_ip, rtp_port, codecs)
+        logger.info("Offer SDP PTs=%s; supported locally=[0,8]", pt_list)
         sdp_str = sdp_bytes.decode()
         invite = build_invite(
             request_uri,
@@ -829,19 +830,6 @@ class SIPManager:
                     logger.info(
                         f"Negotiated codec: {codec_name} (PT={payload_pt})"
                     )
-                    rtp = RtpSession(
-                        local_ip,
-                        rtp_port,
-                        payload_pt,
-                        symmetric=symmetric,
-                        save_wav=save_wav,
-                        forced=rtp_port_forced,
-                    )
-                    rtp.rtcp = rtcp
-                    rtp.tone_hz = tone_hz
-                    rtp.send_silence = send_silence and not tone_hz
-                    rtp.stats_interval = stats_interval
-                    rtp.start(remote_ip, remote_port)
                     to_header = headers.get("to", to_header)
                     contact = headers.get("contact")
                     if contact:
@@ -881,6 +869,24 @@ class SIPManager:
                         contact_user,
                     )
                     s.send(ack)
+                    if payload_pt not in (0, 8):
+                        logger.warning("unsupported negotiated codec")
+                        invite_cseq = send_bye(invite_cseq + 1)
+                        result = "unsupported-codec"
+                        break
+                    rtp = RtpSession(
+                        local_ip,
+                        rtp_port,
+                        payload_pt,
+                        symmetric=symmetric,
+                        save_wav=save_wav,
+                        forced=rtp_port_forced,
+                    )
+                    rtp.rtcp = rtcp
+                    rtp.tone_hz = tone_hz
+                    rtp.send_silence = send_silence and not tone_hz
+                    rtp.stats_interval = stats_interval
+                    rtp.start(remote_ip, remote_port)
                     call_established = True
                     talk_start = time.monotonic()
                     if wait_bye:
