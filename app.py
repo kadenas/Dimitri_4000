@@ -25,12 +25,11 @@ from sip_manager import (
     SIPManager,
     build_options,
     build_response,
-    build_sdp,
-    parse_sdp,
     build_bye,
     parse_headers,
     status_from_response,
 )
+from sdp import build_sdp, parse_sdp, PT_FROM_CODEC_NAME, CODEC_NAME_FROM_PT
 from rtp import RtpSession
 
 
@@ -82,12 +81,6 @@ def parse_args():
         help="Si >0, tras ACK enviar BYE a los N segundos",
     )
     p.add_argument(
-        "--uas-codec",
-        choices=["pcmu", "pcma"],
-        default="pcmu",
-        help="Codec SDP para UAS",
-    )
-    p.add_argument(
         "--uas-rtp-port",
         type=int,
         default=40002,
@@ -124,7 +117,21 @@ def parse_args():
         default=0.0,
         help="Segundos; si se supera sin BYE, enviar BYE y cerrar (0=infinito)",
     )
-    p.add_argument("--codec", choices=["pcmu", "pcma"], default="pcmu", help="Codec SDP")
+    p.add_argument(
+        "--codecs",
+        default="pcmu,pcma",
+        help="Lista de códecs permitidos/orden de preferencia",
+    )
+    p.add_argument(
+        "--codec",
+        choices=["pcmu", "pcma"],
+        help="(compat) equivalente a --codecs <valor>",
+    )
+    p.add_argument(
+        "--prefer",
+        choices=["pcmu", "pcma"],
+        help="Si ambos están disponibles, fuerza preferencia local",
+    )
     p.add_argument("--rtp-port", type=int, default=40000, help="Puerto RTP local")
     p.add_argument("--rtcp", action="store_true", help="Abrir puerto RTCP")
     p.add_argument("--rtp-tone", type=int, help="Enviar tono continuo (Hz)")
@@ -149,6 +156,22 @@ def parse_args():
     p.add_argument("port", nargs="?", type=int, help="Puerto destino (compat)")
     args = p.parse_args()
     args.rtp_port_forced = any(a.startswith("--rtp-port") for a in sys.argv[1:])
+
+    # Handle codec options
+    if args.codec:
+        args.codecs = args.codec
+    codec_list = [c.strip().lower() for c in args.codecs.split(",") if c.strip()]
+    valid = set(PT_FROM_CODEC_NAME.keys())
+    for c in codec_list:
+        if c not in valid:
+            raise SystemExit(f"Codec desconocido: {c}")
+    args.codecs = codec_list
+    if args.prefer:
+        args.prefer = args.prefer.lower()
+        if args.prefer not in args.codecs:
+            logger.warning("--prefer %s ignorado; no está en --codecs", args.prefer)
+            args.prefer = None
+
     return args
 
 
@@ -158,7 +181,6 @@ def main():
     if args.uas and not args.service:
         args.service = True
     if args.uas:
-        args.uas_codec = args.codec
         args.uas_rtp_port = args.rtp_port
 
     if args.reply_options and not args.service:
@@ -208,7 +230,7 @@ def main():
                 talk_time=args.talk_time,
                 wait_bye=args.wait_bye,
                 max_call_time=args.max_call_time,
-                codec=args.codec,
+                codecs=args.codecs,
                 rtp_port=args.rtp_port,
                 rtp_port_forced=args.rtp_port_forced,
                 rtcp=args.rtcp,
@@ -254,7 +276,8 @@ def main():
 
         local_ip = args.bind_ip or sock.getsockname()[0]
         local_port = sock.getsockname()[1]
-        codec_pt = 0 if args.codec.lower() == "pcmu" else 8
+        local_pts = [PT_FROM_CODEC_NAME[c] for c in args.codecs]
+        first_pt = local_pts[0]
         contact_ip = args.advertised_ip or local_ip
         user = "dimitri"
         tag_local = uuid.uuid4().hex[:8]
@@ -396,7 +419,37 @@ def main():
                             body = b""
                             if b"\r\n\r\n" in data:
                                 body = data.split(b"\r\n\r\n", 1)[1]
-                            rip, rport, rpt = parse_sdp(body.decode(errors="ignore"))
+                            sdp_info = parse_sdp(body)
+                            rip = sdp_info.get("ip")
+                            rport = sdp_info.get("audio_port")
+                            remote_pts = sdp_info.get("pts") or []
+                            chosen_pt = None
+                            if remote_pts:
+                                common = [pt for pt in remote_pts if pt in local_pts]
+                                if not common:
+                                    headers488 = {
+                                        "Via": via,
+                                        "From": fr,
+                                        "To": to,
+                                        "Call-ID": call_id,
+                                        "CSeq": cseq_hdr,
+                                    }
+                                    sock.sendto(
+                                        build_response(488, "Not Acceptable Here", headers488),
+                                        addr,
+                                    )
+                                    continue
+                                if args.prefer:
+                                    prefer_pt = PT_FROM_CODEC_NAME[args.prefer]
+                                    if prefer_pt in common:
+                                        chosen_pt = prefer_pt
+                                if chosen_pt is None:
+                                    for pt in local_pts:
+                                        if pt in common:
+                                            chosen_pt = pt
+                                            break
+                            else:
+                                chosen_pt = first_pt
                             dialog = {
                                 "peer_addr": addr,
                                 "from_uri": fr,
@@ -413,7 +466,8 @@ def main():
                                 "cseq_hdr": cseq_hdr,
                                 "local_ip": contact_ip,
                                 "local_port": local_port,
-                                "remote_rtp": (rip, rport, rpt),
+                                "remote_rtp": (rip, rport),
+                                "pt": chosen_pt,
                             }
                             dialogs[key] = dialog
                             resp = build_response(
@@ -505,8 +559,8 @@ def main():
                                     elif dialog.get("state") == "answered":
                                         dialog["state"] = "established"
                                         cancel_events(key, ["200_retx", "timer_m"])
-                                        rip, rport, rpt = dialog.get("remote_rtp", (None, None, None))
-                                        pt_use = rpt if rpt is not None else codec_pt
+                                        rip, rport = dialog.get("remote_rtp", (None, None))
+                                        pt_use = dialog.get("pt", first_pt)
                                         rtp = RtpSession(
                                             dialog["local_ip"],
                                             args.rtp_port,
@@ -614,9 +668,13 @@ def main():
                                 "Contact": f"<sip:{user}@{contact_ip}:{sock.getsockname()[1]}>",
                                 "Content-Type": "application/sdp",
                             }
-                            sdp = build_sdp(contact_ip, args.rtp_port, codec_pt)
+                            sdp = build_sdp(contact_ip, args.rtp_port, [dialog["pt"]])
                             sock.sendto(
                                 build_response(200, "OK", headers, sdp), dialog["peer_addr"]
+                            )
+                            codec_name = CODEC_NAME_FROM_PT.get(dialog["pt"], str(dialog["pt"]))
+                            logger.info(
+                                f"Negotiated codec: {codec_name} (PT={dialog['pt']})"
                             )
                             dialog["state"] = "answered"
                             dialog["retx"] = 0.5
@@ -633,7 +691,7 @@ def main():
                                     "Contact": f"<sip:{user}@{contact_ip}:{sock.getsockname()[1]}>",
                                     "Content-Type": "application/sdp",
                                 }
-                                sdp = build_sdp(contact_ip, args.rtp_port, codec_pt)
+                                sdp = build_sdp(contact_ip, args.rtp_port, [dialog["pt"]])
                                 sock.sendto(
                                     build_response(200, "OK", headers, sdp),
                                     dialog["peer_addr"],
