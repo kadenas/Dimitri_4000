@@ -165,11 +165,13 @@ Ejemplo 2: UAS con timbres y BYE automático tras 10 s:
 python app.py --uas --uas-ring-delay 1 --uas-answer-after 3 --uas-talk-time 10 --bind-ip 10.1.64.18 --src-port 5062
 ```
 
-Limitaciones: no soporta PRACK ni Record-Route.
+Limitaciones: no soporta PRACK.
 
 El `Contact` del `200 OK` incluye siempre el puerto local real. El cliente
 envía el `ACK` al host:puerto indicado en ese `Contact` (si no trae puerto, se
 usa el puerto origen del `200 OK`).
+Las peticiones dentro del diálogo (BYE, etc.) siguen el `Record-Route` recibido
+en el `200 OK` para construir el `Route` set.
 
 ### Interfaz interactiva
 
