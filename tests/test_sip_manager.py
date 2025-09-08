@@ -11,6 +11,7 @@ from sip_manager import (
     build_response,
     build_sdp,
     build_bye,
+    build_bye_request,
     parse_headers,
     status_from_response,
     normalize_number,
@@ -18,6 +19,7 @@ from sip_manager import (
     build_invite,
     parse_auth,
     build_digest_auth,
+    _route_set_from_record_route,
 )
 
 
@@ -80,11 +82,37 @@ def test_build_bye_uses_dialog_fields():
     assert "From: <sip:bob@10.0.0.2>;tag=ltag" in text
 
 
+def test_build_bye_request_includes_route_set():
+    bye = build_bye_request(
+        "sip:bob@10.0.0.1",
+        "<sip:bob@10.0.0.1>;tag=abc",
+        "10.0.0.2",
+        5060,
+        "sip:alice@10.0.0.2",
+        None,
+        "cid",
+        2,
+        "ltag",
+        "+1000",
+        route_set=["<sip:proxy1;lr>", "<sip:proxy2>"]
+    )
+    text = bye.decode()
+    assert "Route: <sip:proxy1;lr>" in text
+    assert "Route: <sip:proxy2>" in text
+    assert text.index("Route: <sip:proxy1;lr>") < text.index("Route: <sip:proxy2>")
+
+
 def test_normalize_number_and_make_uri():
     assert normalize_number(" +34 987-123-456 ") == "+34987123456"
     with pytest.raises(ValueError):
         normalize_number("abc123")
     assert make_uri("alice", "example.com") == "sip:alice@example.com"
+
+
+def test_route_set_from_record_route_reverses_order():
+    rr = "<sip:proxy1;lr>, <sip:proxy2>"
+    rs = _route_set_from_record_route(rr)
+    assert rs == ["<sip:proxy2>", "<sip:proxy1;lr>"]
 
 
 def test_build_invite_includes_pai_and_display():

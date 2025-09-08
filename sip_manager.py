@@ -235,6 +235,7 @@ def build_bye_request(
     tag: str,
     contact_user: str,
     auth_header: tuple[str, str] | None = None,
+    route_set: list[str] | None = None,
 ) -> bytes:
     """Build a BYE request for the caller side (UAC)."""
     branch = "z9hG4bK" + uuid.uuid4().hex
@@ -250,6 +251,11 @@ def build_bye_request(
         f"To: {to_header}\r\n"
         f"Call-ID: {call_id}\r\n"
         f"CSeq: {cseq} BYE\r\n"
+    )
+    if route_set:
+        for r in route_set:
+            msg += f"Route: {r}\r\n"
+    msg += (
         f"Contact: <sip:{contact_user}@{local_ip}:{local_port}>\r\n"
         "User-Agent: Dimitri-4000/0.1\r\n"
     )
@@ -268,7 +274,10 @@ def _contact_uri_host_port(contact: str) -> Tuple[str, str, int | None]:
     uri = contact
     if "<" in contact and ">" in contact:
         uri = contact.split("<", 1)[1].split(">", 1)[0]
-    hostport = uri.split("@")[-1]
+    uri_no_scheme = uri[4:] if uri.lower().startswith("sip:") else uri
+    hostport = uri_no_scheme.split("@")[-1]
+    if ";" in hostport:
+        hostport = hostport.split(";", 1)[0]
     if ":" in hostport:
         host, port_s = hostport.split(":", 1)
         try:
@@ -278,6 +287,32 @@ def _contact_uri_host_port(contact: str) -> Tuple[str, str, int | None]:
     else:
         host, port = hostport, None
     return uri, host, port
+
+
+def _route_set_from_record_route(rr_header: str) -> list[str]:
+    """Return a route set (reversed) from a Record-Route header value."""
+    if not rr_header:
+        return []
+    parts = []
+    current = []
+    depth = 0
+    for ch in rr_header:
+        if ch == ',' and depth == 0:
+            part = ''.join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+            continue
+        if ch == '<':
+            depth += 1
+        elif ch == '>':
+            if depth > 0:
+                depth -= 1
+        current.append(ch)
+    part = ''.join(current).strip()
+    if part:
+        parts.append(part)
+    return list(reversed(parts))
 
 
 def build_response(
@@ -547,18 +582,19 @@ class SIPManager:
         ring_deadline = t_start + ring_timeout
         canceled = False
         cancel_deadline = None
-        contact_uri = request_uri
+        remote_target = request_uri
+        route_set: list[str] = []
         to_header = f"<{to_uri}>"
         
         def send_bye(cseq: int) -> int:
-            nonlocal to_header
+            nonlocal to_header, remote_target
             auth_hdr = None
             if auth_user and auth_pass and auth_state.get("nonce"):
                 cnonce = secrets.token_hex(8)
                 auth_state["nc"] = auth_state.get("nc", 0) + 1
                 auth_val = build_digest_auth(
                     "BYE",
-                    contact_uri,
+                    remote_target,
                     auth_username,
                     auth_pass,
                     auth_state["realm"],
@@ -570,8 +606,21 @@ class SIPManager:
                 )
                 hdr_name = "Proxy-Authorization" if auth_state.get("proxy") else "Authorization"
                 auth_hdr = (hdr_name, auth_val)
+            send_uri = remote_target
+            if route_set:
+                last = route_set[-1]
+                if remote_target not in last:
+                    send_uri = route_set[0]
+            if send_uri != remote_target:
+                try:
+                    _, h, p = _contact_uri_host_port(send_uri)
+                    if p is None:
+                        p = s.getpeername()[1]
+                    s.connect((h, p))
+                except Exception:
+                    pass
             bye = build_bye_request(
-                contact_uri,
+                remote_target,
                 to_header,
                 local_ip,
                 local_port,
@@ -582,6 +631,7 @@ class SIPManager:
                 tag,
                 contact_user,
                 auth_header=auth_hdr,
+                route_set=route_set,
             )
             s.send(bye)
             while True:
@@ -603,7 +653,7 @@ class SIPManager:
                         to_hdr = headers2.get("to", to_header)
                         to_header = to_hdr
                         ack = build_ack(
-                            contact_uri,
+                            remote_target,
                             to_hdr,
                             local_ip,
                             local_port,
@@ -620,7 +670,7 @@ class SIPManager:
                         auth_state["nc"] = auth_state.get("nc", 0) + 1
                         auth_val = build_digest_auth(
                             "BYE",
-                            contact_uri,
+                            remote_target,
                             auth_username,
                             auth_pass,
                             realm,
@@ -632,7 +682,7 @@ class SIPManager:
                         )
                         hdr_name = "Proxy-Authorization" if c2 == 407 else "Authorization"
                         bye = build_bye_request(
-                            contact_uri,
+                            remote_target,
                             to_hdr,
                             local_ip,
                             local_port,
@@ -643,6 +693,7 @@ class SIPManager:
                             tag,
                             contact_user,
                             auth_header=(hdr_name, auth_val),
+                            route_set=route_set,
                         )
                         s.send(bye)
                         auth_state["bye_auth_done"] = True
@@ -797,7 +848,6 @@ class SIPManager:
                     setup_ms = int((time.monotonic() - t_start) * 1000)
                     logger.info(f"200 OK en {setup_ms} ms")
                     to_header = headers.get("to", to_header)
-                    contact = headers.get("contact")
                     body = b""
                     if b"\r\n\r\n" in data:
                         body = data.split(b"\r\n\r\n", 1)[1]
@@ -820,30 +870,31 @@ class SIPManager:
                     to_header = headers.get("to", to_header)
                     contact = headers.get("contact")
                     if contact:
-                        contact_uri, host, port = _contact_uri_host_port(contact)
+                        remote_target, host, port = _contact_uri_host_port(contact)
                         if port is None:
                             try:
                                 port = s.getpeername()[1]
                             except OSError:
                                 port = 5060
-                            if "@" in contact_uri:
-                                user_part, host_part = contact_uri.split("@", 1)
+                            if "@" in remote_target:
+                                user_part, host_part = remote_target.split("@", 1)
                                 if ";" in host_part:
                                     host_only, params = host_part.split(";", 1)
-                                    contact_uri = (
-                                        f"{user_part}@{host_only}:{port};{params}"
-                                    )
+                                    remote_target = f"{user_part}@{host_only}:{port};{params}"
                                 else:
-                                    contact_uri = f"{user_part}@{host_part}:{port}"
-                            elif contact_uri.startswith("sip:"):
-                                host_only = contact_uri[4:]
-                                contact_uri = f"sip:{host_only}:{port}"
+                                    remote_target = f"{user_part}@{host_part}:{port}"
+                            elif remote_target.startswith("sip:"):
+                                host_only = remote_target[4:]
+                                remote_target = f"sip:{host_only}:{port}"
                         try:
                             s.connect((host, port))
                         except OSError:
                             pass
+                    rr = headers.get("record-route")
+                    if rr:
+                        route_set = _route_set_from_record_route(rr)
                     ack = build_ack(
-                        contact_uri,
+                        remote_target,
                         to_header,
                         local_ip,
                         local_port,
@@ -951,7 +1002,7 @@ class SIPManager:
 
         except KeyboardInterrupt:
             logger.info("Llamada abortada por usuario")
-            if call_established and 'contact_uri' in locals():
+            if call_established and 'remote_target' in locals():
                 try:
                     invite_cseq = send_bye(invite_cseq + 1)
                 except OSError:
