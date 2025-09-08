@@ -204,6 +204,21 @@ Intento con CANCEL por no respuesta:
 python app.py --invite --to sip:10.1.72.188 --dst 10.1.72.188 --ring-timeout 5 --talk-time 0
 ```
 
+### Finalización de la llamada
+
+Existen tres modos para terminar una llamada del lado UAC:
+
+1. `--talk-time N` (por defecto 5) – tras enviar `ACK` espera *N* segundos y
+   envía `BYE` propio.
+2. `--talk-time 0` sin `--wait-bye` – la llamada finaliza inmediatamente tras
+   el `ACK`, sin enviar `BYE`.
+3. `--wait-bye` – se mantiene la sesión activa hasta recibir un `BYE` remoto.
+   Con `--max-call-time N` se limita la espera; si se supera, se envía un `BYE`
+   propio y se cierra la llamada.
+
+En cualquiera de los casos, `Ctrl+C` durante la espera envía un único `BYE` y
+termina limpiamente con `result=aborted`.
+
 ### Timeout y CANCEL
 
 Cuando se supera `--ring-timeout` se envía un `CANCEL` y se espera hasta 5 s
