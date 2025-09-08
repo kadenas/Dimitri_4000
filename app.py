@@ -24,10 +24,12 @@ from sip_manager import (
     build_options,
     build_response,
     build_sdp,
+    parse_sdp,
     build_bye,
     parse_headers,
     status_from_response,
 )
+from rtp import RtpSession
 
 
 def write_csv_row(path, row, header=None):
@@ -111,6 +113,17 @@ def parse_args():
     p.add_argument("--talk-time", type=float, default=5.0, help="Tiempo de conversación antes de enviar BYE")
     p.add_argument("--codec", choices=["pcmu", "pcma"], default="pcmu", help="Codec SDP")
     p.add_argument("--rtp-port", type=int, default=40000, help="Puerto RTP local")
+    p.add_argument("--rtcp", action="store_true", help="Abrir puerto RTCP")
+    p.add_argument("--rtp-tone", type=int, help="Enviar tono continuo (Hz)")
+    p.add_argument("--rtp-send-silence", action="store_true", help="Enviar silencio si no hay tono")
+    p.add_argument("--symmetric-rtp", action="store_true", help="Aprender IP:puerto remoto de RTP")
+    p.add_argument("--rtp-save-wav", help="Guardar audio recibido a WAV")
+    p.add_argument(
+        "--rtp-stats-every",
+        type=float,
+        default=2.0,
+        help="Segundos entre logs de métricas RTP",
+    )
     # Compatibilidad con la CLI antigua: host [port]
     p.add_argument("host", nargs="?", help="Destino (compat)")
     p.add_argument("port", nargs="?", type=int, help="Puerto destino (compat)")
@@ -122,6 +135,9 @@ def main():
 
     if args.uas and not args.service:
         args.service = True
+    if args.uas:
+        args.uas_codec = args.codec
+        args.uas_rtp_port = args.rtp_port
 
     if args.reply_options and not args.service:
         raise SystemExit("--reply-options requiere --service")
@@ -166,6 +182,12 @@ def main():
                 talk_time=args.talk_time,
                 codec=args.codec,
                 rtp_port=args.rtp_port,
+                rtcp=args.rtcp,
+                tone_hz=args.rtp_tone,
+                send_silence=args.rtp_send_silence,
+                symmetric=args.symmetric_rtp,
+                save_wav=args.rtp_save_wav,
+                stats_interval=args.rtp_stats_every,
             )
         except KeyboardInterrupt:
             raise SystemExit(130)
@@ -198,6 +220,7 @@ def main():
 
         local_ip = args.bind_ip or sock.getsockname()[0]
         local_port = sock.getsockname()[1]
+        codec_pt = 0 if args.codec.lower() == "pcmu" else 8
         contact_ip = args.advertised_ip or local_ip
         user = "dimitri"
         tag_local = uuid.uuid4().hex[:8]
@@ -336,6 +359,10 @@ def main():
                                 peer_uri = peer_uri.split("<", 1)[1].split(">", 1)[0]
                             else:
                                 peer_uri = fr.split("<", 1)[1].split(">", 1)[0]
+                            body = b""
+                            if b"\r\n\r\n" in data:
+                                body = data.split(b"\r\n\r\n", 1)[1]
+                            rip, rport, rpt = parse_sdp(body.decode(errors="ignore"))
                             dialog = {
                                 "peer_addr": addr,
                                 "from_uri": fr,
@@ -352,6 +379,7 @@ def main():
                                 "cseq_hdr": cseq_hdr,
                                 "local_ip": contact_ip,
                                 "local_port": local_port,
+                                "remote_rtp": (rip, rport, rpt),
                             }
                             dialogs[key] = dialog
                             resp = build_response(
@@ -443,6 +471,21 @@ def main():
                                     elif dialog.get("state") == "answered":
                                         dialog["state"] = "established"
                                         cancel_events(key, ["200_retx", "timer_m"])
+                                        rip, rport, rpt = dialog.get("remote_rtp", (None, None, None))
+                                        pt_use = rpt if rpt is not None else codec_pt
+                                        rtp = RtpSession(
+                                            dialog["local_ip"],
+                                            args.rtp_port,
+                                            pt_use,
+                                            symmetric=args.symmetric_rtp,
+                                            save_wav=args.rtp_save_wav,
+                                        )
+                                        rtp.rtcp = args.rtcp
+                                        rtp.tone_hz = args.rtp_tone
+                                        rtp.send_silence = args.rtp_send_silence and not args.rtp_tone
+                                        rtp.stats_interval = args.rtp_stats_every
+                                        rtp.start(rip, rport)
+                                        dialog["rtp"] = rtp
                                         if args.uas_talk_time > 0:
                                             schedule(key, "bye", args.uas_talk_time)
                     elif args.uas and start.startswith("BYE "):
@@ -475,6 +518,8 @@ def main():
                                 },
                             )
                             sock.sendto(resp, addr)
+                            if dialog and dialog.get("rtp"):
+                                dialog["rtp"].stop()
                             cancel_events(key)
                             dialogs.pop(key, None)
                     else:
@@ -534,7 +579,7 @@ def main():
                                 "Contact": f"<sip:{user}@{contact_ip}:{sock.getsockname()[1]}>",
                                 "Content-Type": "application/sdp",
                             }
-                            sdp = build_sdp(contact_ip, args.uas_rtp_port, args.uas_codec)
+                            sdp = build_sdp(contact_ip, args.rtp_port, codec_pt)
                             sock.sendto(
                                 build_response(200, "OK", headers, sdp), dialog["peer_addr"]
                             )
@@ -553,7 +598,7 @@ def main():
                                     "Contact": f"<sip:{user}@{contact_ip}:{sock.getsockname()[1]}>",
                                     "Content-Type": "application/sdp",
                                 }
-                                sdp = build_sdp(contact_ip, args.uas_rtp_port, args.uas_codec)
+                                sdp = build_sdp(contact_ip, args.rtp_port, codec_pt)
                                 sock.sendto(
                                     build_response(200, "OK", headers, sdp),
                                     dialog["peer_addr"],
@@ -567,8 +612,12 @@ def main():
                             bye = build_bye(dialog)
                             sock.sendto(bye, dialog["peer_addr"])
                             dialog["state"] = "bye_sent"
+                            if dialog.get("rtp"):
+                                dialog["rtp"].stop()
                             schedule(key, "del", 5)
                         elif etype == "del":
+                            if dialog.get("rtp"):
+                                dialog["rtp"].stop()
                             dialogs.pop(key, None)
                             cancel_events(key)
 

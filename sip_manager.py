@@ -4,6 +4,7 @@ import socket
 import time
 import uuid
 from typing import Tuple
+from rtp import RtpSession
 
 logger = logging.getLogger("socket_handler")
 
@@ -242,12 +243,9 @@ def build_response(
         return "".join(lines).encode()
 
 
-def build_sdp(local_ip: str, rtp_port: int, codec: str) -> str:
-    """Return a minimal SDP offer/answer."""
-    codec = codec.lower()
-    if codec not in {"pcmu", "pcma"}:
-        codec = "pcmu"
-    pt = 0 if codec == "pcmu" else 8
+def build_sdp(local_ip: str, rtp_port: int, pt: int) -> str:
+    """Return a minimal SDP offer/answer for a single codec."""
+    codec = "PCMU" if pt == 0 else "PCMA"
     return (
         "v=0\r\n"
         f"o=dimitri 0 0 IN IP4 {local_ip}\r\n"
@@ -255,8 +253,30 @@ def build_sdp(local_ip: str, rtp_port: int, codec: str) -> str:
         f"c=IN IP4 {local_ip}\r\n"
         "t=0 0\r\n"
         f"m=audio {rtp_port} RTP/AVP {pt}\r\n"
-        f"a=rtpmap:{pt} {codec.upper()}/8000\r\n"
+        f"a=rtpmap:{pt} {codec}/8000\r\n"
+        "a=sendrecv\r\n"
     )
+
+
+def parse_sdp(text: str) -> tuple[str | None, int | None, int | None]:
+    """Extract connection IP, port and PT from SDP."""
+    ip = None
+    port = None
+    pt = None
+    for line in text.splitlines():
+        if line.startswith("c=") and ip is None:
+            parts = line.split()
+            if len(parts) >= 3:
+                ip = parts[2]
+        elif line.startswith("m=audio") and port is None:
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    port = int(parts[1])
+                    pt = int(parts[3])
+                except ValueError:
+                    pass
+    return ip, port, pt
 
 
 def build_bye(dialog: dict) -> bytes:
@@ -389,6 +409,12 @@ class SIPManager:
         talk_time: float = 5.0,
         codec: str = "pcmu",
         rtp_port: int = 40000,
+        rtcp: bool = False,
+        tone_hz: int | None = None,
+        send_silence: bool = False,
+        symmetric: bool = False,
+        save_wav: str | None = None,
+        stats_interval: float = 2.0,
     ) -> tuple[str, str, int, float]:
         if self.protocol != "udp":
             raise NotImplementedError("Solo UDP por ahora.")
@@ -425,7 +451,8 @@ class SIPManager:
         call_id = str(uuid.uuid4())
         branch = "z9hG4bK" + uuid.uuid4().hex
         tag = uuid.uuid4().hex[:8]
-        sdp = build_sdp(local_ip, rtp_port, codec)
+        pt = 0 if codec.lower() == "pcmu" else 8
+        sdp = build_sdp(local_ip, rtp_port, pt)
         invite = build_invite(
             request_uri,
             from_uri,
@@ -530,6 +557,27 @@ class SIPManager:
                 if code == 200:
                     setup_ms = int((time.monotonic() - t_start) * 1000)
                     logger.info(f"200 OK en {setup_ms} ms")
+                    to_header = headers.get("to", to_header)
+                    contact = headers.get("contact")
+                    body = b""
+                    if b"\r\n\r\n" in data:
+                        body = data.split(b"\r\n\r\n", 1)[1]
+                    rip, rport, rpt = parse_sdp(body.decode(errors="ignore"))
+                    remote_ip = rip or dst_host
+                    remote_port = rport or rtp_port
+                    payload_pt = rpt if rpt is not None else pt
+                    rtp = RtpSession(
+                        local_ip,
+                        rtp_port,
+                        payload_pt,
+                        symmetric=symmetric,
+                        save_wav=save_wav,
+                    )
+                    rtp.rtcp = rtcp
+                    rtp.tone_hz = tone_hz
+                    rtp.send_silence = send_silence and not tone_hz
+                    rtp.stats_interval = stats_interval
+                    rtp.start(remote_ip, remote_port)
                     to_header = headers.get("to", to_header)
                     contact = headers.get("contact")
                     if contact:
@@ -645,6 +693,8 @@ class SIPManager:
             raise
         finally:
             s.close()
+            if 'rtp' in locals():
+                rtp.stop()
 
         talk_s = talk_time if result == "answered" else 0
         return call_id, result, setup_ms or 0, talk_s

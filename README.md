@@ -241,3 +241,23 @@ PY
 
 Este ejemplo crea un `SIPManager`, envía un INVITE y muestra la respuesta y el
 tiempo empleado.
+
+## RTP básico
+
+Soporte RTP sencillo está disponible para los códecs PCMU/PCMA. No incluye
+SRTP ni ICE, por lo que en redes con NAT se requiere abrir puertos o habilitar
+`--symmetric-rtp`.
+
+Ejemplo de bucle local (UAS/UAC en la misma máquina):
+
+```bash
+UAS: python app.py --uas --bind-ip 192.168.0.137 --src-port 5062 \
+     --uas-answer-after 1 --rtp-port 40000 --codec pcmu --rtp-stats-every 1
+UAC: python app.py --invite --dst 192.168.0.137 --dst-port 5062 --src-port 5060 \
+     --rtp-port 42000 --codec pcmu --rtp-tone 1000 --rtp-stats-every 1
+```
+
+Se puede guardar el audio recibido en un WAV con `--rtp-save-wav`.
+
+Limitaciones: no hay SRTP, ICE ni cancelación de eco; la detección de NAT es
+básica.
