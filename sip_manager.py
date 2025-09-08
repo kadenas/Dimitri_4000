@@ -1,10 +1,24 @@
 import logging
+import re
 import socket
 import time
 import uuid
 from typing import Tuple
 
 logger = logging.getLogger("socket_handler")
+
+
+def normalize_number(s: str) -> str:
+    """Return the number normalized removing spaces/hyphens."""
+    s = s.replace(" ", "").replace("-", "")
+    if re.fullmatch(r"\+?\d+", s):
+        return s
+    raise ValueError("numero invalido")
+
+
+def make_uri(user: str, domain: str) -> str:
+    """Build a SIP URI from user and domain."""
+    return f"sip:{user}@{domain}"
 
 
 def status_from_response(data: bytes):
@@ -44,29 +58,44 @@ def build_options(
 
 
 def build_invite(
+    request_uri: str,
+    from_uri: str,
     to_uri: str,
     local_ip: str,
     local_port: int,
-    from_user: str,
     call_id: str,
     cseq: int,
     tag: str,
     branch: str,
     sdp: str,
+    from_display: str | None = None,
+    contact_user: str | None = None,
+    pai: str | None = None,
+    use_pai: bool = False,
+    use_pai_asserted: bool = False,
 ) -> bytes:
     sent_by = f"{local_ip}:{local_port}"
     content_length = len(sdp.encode())
+    from_hdr = f"<{from_uri}>;tag={tag}"
+    if from_display:
+        from_hdr = f'"{from_display}" {from_hdr}'
     msg = (
-        f"INVITE {to_uri} SIP/2.0\r\n"
+        f"INVITE {request_uri} SIP/2.0\r\n"
         f"Via: SIP/2.0/UDP {sent_by};branch={branch};rport\r\n"
         "Max-Forwards: 70\r\n"
-        f"From: \"{from_user}\" <sip:{from_user}@{local_ip}>;tag={tag}\r\n"
+        f"From: {from_hdr}\r\n"
         f"To: <{to_uri}>\r\n"
         f"Call-ID: {call_id}\r\n"
         f"CSeq: {cseq} INVITE\r\n"
-        f"Contact: <sip:{from_user}@{local_ip}>\r\n"
+        f"Contact: <sip:{contact_user}@{local_ip}:{local_port}>\r\n"
         "User-Agent: Dimitri-4000/0.1\r\n"
         "Allow: INVITE, ACK, CANCEL, BYE, OPTIONS\r\n"
+    )
+    if use_pai and pai:
+        msg += f"P-Preferred-Identity: <{pai}>\r\n"
+    if use_pai_asserted and pai:
+        msg += f"P-Asserted-Identity: <{pai}>\r\n"
+    msg += (
         "Content-Type: application/sdp\r\n"
         f"Content-Length: {content_length}\r\n\r\n"
         f"{sdp}"
@@ -79,22 +108,27 @@ def build_ack(
     to_header: str,
     local_ip: str,
     local_port: int,
-    from_user: str,
+    from_uri: str,
+    from_display: str | None,
     call_id: str,
     cseq: int,
     tag: str,
+    contact_user: str,
 ) -> bytes:
     branch = "z9hG4bK" + uuid.uuid4().hex
     sent_by = f"{local_ip}:{local_port}"
+    from_hdr = f"<{from_uri}>;tag={tag}"
+    if from_display:
+        from_hdr = f'"{from_display}" {from_hdr}'
     msg = (
         f"ACK {request_uri} SIP/2.0\r\n"
         f"Via: SIP/2.0/UDP {sent_by};branch={branch};rport\r\n"
         "Max-Forwards: 70\r\n"
-        f"From: \"{from_user}\" <sip:{from_user}@{local_ip}>;tag={tag}\r\n"
+        f"From: {from_hdr}\r\n"
         f"To: {to_header}\r\n"
         f"Call-ID: {call_id}\r\n"
         f"CSeq: {cseq} ACK\r\n"
-        f"Contact: <sip:{from_user}@{local_ip}>\r\n"
+        f"Contact: <sip:{contact_user}@{local_ip}:{local_port}>\r\n"
         "User-Agent: Dimitri-4000/0.1\r\n"
         "Allow: INVITE, ACK, CANCEL, BYE, OPTIONS\r\n"
         "Content-Length: 0\r\n\r\n"
@@ -103,25 +137,31 @@ def build_ack(
 
 
 def build_cancel(
+    request_uri: str,
     to_uri: str,
     local_ip: str,
     local_port: int,
-    from_user: str,
+    from_uri: str,
+    from_display: str | None,
     call_id: str,
     cseq: int,
     tag: str,
     branch: str,
+    contact_user: str,
 ) -> bytes:
     sent_by = f"{local_ip}:{local_port}"
+    from_hdr = f"<{from_uri}>;tag={tag}"
+    if from_display:
+        from_hdr = f'"{from_display}" {from_hdr}'
     msg = (
-        f"CANCEL {to_uri} SIP/2.0\r\n"
+        f"CANCEL {request_uri} SIP/2.0\r\n"
         f"Via: SIP/2.0/UDP {sent_by};branch={branch};rport\r\n"
         "Max-Forwards: 70\r\n"
-        f"From: \"{from_user}\" <sip:{from_user}@{local_ip}>;tag={tag}\r\n"
+        f"From: {from_hdr}\r\n"
         f"To: <{to_uri}>\r\n"
         f"Call-ID: {call_id}\r\n"
         f"CSeq: {cseq} CANCEL\r\n"
-        f"Contact: <sip:{from_user}@{local_ip}>\r\n"
+        f"Contact: <sip:{contact_user}@{local_ip}:{local_port}>\r\n"
         "User-Agent: Dimitri-4000/0.1\r\n"
         "Content-Length: 0\r\n\r\n"
     )
@@ -133,23 +173,28 @@ def build_bye_request(
     to_header: str,
     local_ip: str,
     local_port: int,
-    from_user: str,
+    from_uri: str,
+    from_display: str | None,
     call_id: str,
     cseq: int,
     tag: str,
+    contact_user: str,
 ) -> bytes:
     """Build a BYE request for the caller side (UAC)."""
     branch = "z9hG4bK" + uuid.uuid4().hex
     sent_by = f"{local_ip}:{local_port}"
+    from_hdr = f"<{from_uri}>;tag={tag}"
+    if from_display:
+        from_hdr = f'"{from_display}" {from_hdr}'
     msg = (
         f"BYE {request_uri} SIP/2.0\r\n"
         f"Via: SIP/2.0/UDP {sent_by};branch={branch};rport\r\n"
         "Max-Forwards: 70\r\n"
-        f"From: \"{from_user}\" <sip:{from_user}@{local_ip}>;tag={tag}\r\n"
+        f"From: {from_hdr}\r\n"
         f"To: {to_header}\r\n"
         f"Call-ID: {call_id}\r\n"
         f"CSeq: {cseq} BYE\r\n"
-        f"Contact: <sip:{from_user}@{local_ip}>\r\n"
+        f"Contact: <sip:{contact_user}@{local_ip}:{local_port}>\r\n"
         "User-Agent: Dimitri-4000/0.1\r\n"
         "Content-Length: 0\r\n\r\n"
     )
@@ -326,8 +371,16 @@ class SIPManager:
         self,
         dst_host: str,
         dst_port: int,
-        to_uri: str,
-        from_user: str = "dimitri",
+        from_number: str | None = None,
+        from_domain: str | None = None,
+        from_display: str | None = None,
+        to_number: str | None = None,
+        to_domain: str | None = None,
+        from_uri: str | None = None,
+        to_uri: str | None = None,
+        pai: str | None = None,
+        use_pai: bool = False,
+        use_pai_asserted: bool = False,
         bind_ip: str | None = None,
         bind_port: int = 0,
         timeout: float = 2.0,
@@ -345,20 +398,50 @@ class SIPManager:
         )
         s.settimeout(0.5)
 
+        if from_uri:
+            if not from_uri.startswith("sip:"):
+                raise ValueError("from_uri debe empezar por sip:")
+            from_user = from_uri.split("sip:", 1)[1].split("@", 1)[0]
+        else:
+            from_user = normalize_number(from_number) if from_number else "dimitri"
+            from_uri = make_uri(from_user, from_domain or local_ip)
+
+        if to_uri:
+            if not to_uri.startswith("sip:"):
+                raise ValueError("to_uri debe empezar por sip:")
+            to_user = to_uri.split("sip:", 1)[1].split("@", 1)[0]
+            to_domain_part = to_uri.split("@", 1)[1]
+            req_host = dst_host or to_domain_part.split(";", 1)[0]
+            request_uri = make_uri(to_user, req_host)
+        else:
+            if not to_number:
+                raise ValueError("Falta numero destino")
+            to_user = normalize_number(to_number)
+            to_uri = make_uri(to_user, to_domain or dst_host)
+            request_uri = make_uri(to_user, dst_host)
+
+        contact_user = from_user
+
         call_id = str(uuid.uuid4())
         branch = "z9hG4bK" + uuid.uuid4().hex
         tag = uuid.uuid4().hex[:8]
         sdp = build_sdp(local_ip, rtp_port, codec)
         invite = build_invite(
+            request_uri,
+            from_uri,
             to_uri,
             local_ip,
             local_port,
-            from_user,
             call_id,
             cseq_start,
             tag,
             branch,
             sdp,
+            from_display=from_display,
+            contact_user=contact_user,
+            pai=pai,
+            use_pai=use_pai,
+            use_pai_asserted=use_pai_asserted,
         )
 
         logger.info(
@@ -371,7 +454,7 @@ class SIPManager:
         ring_deadline = t_start + ring_timeout
         canceled = False
         cancel_deadline = None
-        contact_uri = to_uri
+        contact_uri = request_uri
         to_header = f"<{to_uri}>"
         setup_ms = None
         result = "timeout"
@@ -381,14 +464,17 @@ class SIPManager:
                 now = time.monotonic()
                 if not canceled and now >= ring_deadline:
                     cancel = build_cancel(
+                        request_uri,
                         to_uri,
                         local_ip,
                         local_port,
-                        from_user,
+                        from_uri,
+                        from_display,
                         call_id,
                         cseq_start,
                         tag,
                         branch,
+                        contact_user,
                     )
                     s.send(cancel)
                     logger.info("Ring timeout, enviado CANCEL")
@@ -420,14 +506,16 @@ class SIPManager:
                     if code == 487:
                         to_header = headers.get("to", to_header)
                         ack = build_ack(
-                            to_uri,
+                            request_uri,
                             to_header,
                             local_ip,
                             local_port,
-                            from_user,
+                            from_uri,
+                            from_display,
                             call_id,
                             cseq_start,
                             tag,
+                            contact_user,
                         )
                         s.send(ack)
                         setup_ms = int((time.monotonic() - t_start) * 1000)
@@ -475,10 +563,12 @@ class SIPManager:
                         to_header,
                         local_ip,
                         local_port,
-                        from_user,
+                        from_uri,
+                        from_display,
                         call_id,
                         cseq_start,
                         tag,
+                        contact_user,
                     )
                     s.send(ack)
                     if talk_time > 0:
@@ -488,10 +578,12 @@ class SIPManager:
                             to_header,
                             local_ip,
                             local_port,
-                            from_user,
+                            from_uri,
+                            from_display,
                             call_id,
                             cseq_start + 1,
                             tag,
+                            contact_user,
                         )
                         s.send(bye)
                         while True:
@@ -509,14 +601,16 @@ class SIPManager:
                 if code == 487:
                     to_header = headers.get("to", to_header)
                     ack = build_ack(
-                        to_uri,
+                        request_uri,
                         to_header,
                         local_ip,
                         local_port,
-                        from_user,
+                        from_uri,
+                        from_display,
                         call_id,
                         cseq_start,
                         tag,
+                        contact_user,
                     )
                     s.send(ack)
                     setup_ms = int((time.monotonic() - t_start) * 1000)
@@ -526,14 +620,16 @@ class SIPManager:
                 if code is not None and code >= 400:
                     to_header = headers.get("to", to_header)
                     ack = build_ack(
-                        to_uri,
+                        request_uri,
                         to_header,
                         local_ip,
                         local_port,
-                        from_user,
+                        from_uri,
+                        from_display,
                         call_id,
                         cseq_start,
                         tag,
+                        contact_user,
                     )
                     s.send(ack)
                     setup_ms = int((time.monotonic() - t_start) * 1000)

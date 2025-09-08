@@ -3,6 +3,8 @@ import sys
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+import pytest
+
 from sip_manager import (
     build_options,
     build_response,
@@ -10,6 +12,9 @@ from sip_manager import (
     build_bye,
     parse_headers,
     status_from_response,
+    normalize_number,
+    make_uri,
+    build_invite,
 )
 
 
@@ -70,3 +75,37 @@ def test_build_bye_uses_dialog_fields():
     assert "BYE sip:alice@10.0.0.1 SIP/2.0" in text
     assert "CSeq: 1 BYE" in text
     assert "From: <sip:bob@10.0.0.2>;tag=ltag" in text
+
+
+def test_normalize_number_and_make_uri():
+    assert normalize_number(" +34 987-123-456 ") == "+34987123456"
+    with pytest.raises(ValueError):
+        normalize_number("abc123")
+    assert make_uri("alice", "example.com") == "sip:alice@example.com"
+
+
+def test_build_invite_includes_pai_and_display():
+    sdp = "v=0\r\n"
+    msg = build_invite(
+        "sip:123@1.1.1.1",
+        "sip:+1000@a.com",
+        "sip:+2000@b.com",
+        "10.0.0.1",
+        5060,
+        "cid",
+        1,
+        "t",
+        "b",
+        sdp,
+        from_display="Tester",
+        contact_user="+1000",
+        pai="sip:+1000@c.com",
+        use_pai=True,
+        use_pai_asserted=True,
+    )
+    text = msg.decode()
+    assert 'INVITE sip:123@1.1.1.1 SIP/2.0' in text
+    assert 'From: "Tester" <sip:+1000@a.com>;tag=t' in text
+    assert 'To: <sip:+2000@b.com>' in text
+    assert 'P-Preferred-Identity: <sip:+1000@c.com>' in text
+    assert 'P-Asserted-Identity: <sip:+1000@c.com>' in text
