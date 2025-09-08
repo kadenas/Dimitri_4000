@@ -95,8 +95,18 @@ def parse_args():
         help="Responder 200 OK a OPTIONS entrantes",
     )
     p.add_argument("--invite", action="store_true", help="Realizar una llamada básica")
-    p.add_argument("--to", help="URI destino para INVITE")
-    p.add_argument("--from-user", default="dimitri", help="Usuario origen")
+    p.add_argument("--to", help="URI destino para INVITE (compat)")
+    p.add_argument("--from-user", default="dimitri", help="Usuario origen (compat)")
+    p.add_argument("--from-number", help="Número origen (From)")
+    p.add_argument("--from-domain", help="Dominio From")
+    p.add_argument("--from-display", help="Display name From")
+    p.add_argument("--to-number", help="Número destino (To)")
+    p.add_argument("--to-domain", help="Dominio To")
+    p.add_argument("--from-uri", help="URI completa From (sip:...)")
+    p.add_argument("--to-uri", help="URI completa To (sip:...)")
+    p.add_argument("--pai", help="URI para P-Preferred/Asserted-Identity")
+    p.add_argument("--use-pai", action="store_true", help="Añadir P-Preferred-Identity")
+    p.add_argument("--use-pai-asserted", action="store_true", help="Añadir P-Asserted-Identity")
     p.add_argument("--ring-timeout", type=float, default=15.0, help="Tiempo de espera antes de cancelar")
     p.add_argument("--talk-time", type=float, default=5.0, help="Tiempo de conversación antes de enviar BYE")
     p.add_argument("--codec", choices=["pcmu", "pcma"], default="pcmu", help="Codec SDP")
@@ -128,16 +138,26 @@ def main():
     if args.invite:
         if not dst:
             raise SystemExit("Falta destino: usa --dst 10.0.0.1")
-        if not args.to:
-            raise SystemExit("Falta --to sip:usuario@host")
-        to_uri = args.to if args.to.startswith("sip:") else f"sip:{args.to}"
+        if not (args.to_uri or args.to_number or args.to):
+            raise SystemExit("Falta --to-number o --to-uri")
+        to_uri = args.to_uri
+        if not to_uri and args.to:
+            to_uri = args.to if args.to.startswith("sip:") else f"sip:{args.to}"
         sm = SIPManager(protocol=args.protocol)
         try:
             call_id, result, setup_ms, talk_s = sm.place_call(
                 dst_host=dst,
                 dst_port=dport,
+                from_number=args.from_number or args.from_user,
+                from_domain=args.from_domain,
+                from_display=args.from_display,
+                to_number=args.to_number,
+                to_domain=args.to_domain,
+                from_uri=args.from_uri,
                 to_uri=to_uri,
-                from_user=args.from_user,
+                pai=args.pai,
+                use_pai=args.use_pai,
+                use_pai_asserted=args.use_pai_asserted,
                 bind_ip=args.bind_ip,
                 bind_port=args.src_port,
                 timeout=args.timeout,
