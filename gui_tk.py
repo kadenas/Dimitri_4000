@@ -4,6 +4,7 @@ import logging
 import threading
 import queue
 import time
+import socket
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from types import SimpleNamespace
@@ -11,7 +12,8 @@ from types import SimpleNamespace
 from sip_manager import SIPManager
 from app import run_load_generator
 
-CONFIG_PATH = os.path.expanduser("~/.dimitri4000.yml")
+# Configuration persisted in user home directory
+CONFIG_PATH = os.path.expanduser("~/.dimitri4000.json")
 
 DEFAULT_CONFIG = {
     "bind_ip": "",
@@ -100,6 +102,11 @@ class App(tk.Tk):
         cfg = DEFAULT_CONFIG.copy()
         cfg.update(load_config())
         self.vars: dict[str, tk.Variable] = {}
+        self.widgets: dict[str, ttk.Entry] = {}
+        # shared SIP manager so dialogs can be controlled from GUI
+        self.sm = SIPManager(protocol="udp")
+        self.load_thread = None
+        self.uas_thread = None
         self._build_ui(cfg)
         self.log_handler = LogHandler(self.event_q)
         logging.getLogger().addHandler(self.log_handler)
@@ -108,82 +115,112 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------------
     def _build_ui(self, cfg):
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Status.OK.TLabel", background="#b6f7a5")
+        style.configure("Status.Bad.TLabel", background="#f7b6b6")
+        style.configure("Status.Warn.TLabel", background="#f7e7a5")
+
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True)
 
+        # ------------------ General tab ------------------
         general = ttk.Frame(nb)
-        identity = ttk.Frame(nb)
-        load = ttk.Frame(nb)
         nb.add(general, text="General")
+
+        lf_origen = ttk.LabelFrame(general, text="Origen")
+        lf_origen.grid(row=0, column=0, sticky="nsew", padx=8, pady=4)
+        self._add_entry(lf_origen, "bind_ip", 0, cfg)
+        self._add_entry(lf_origen, "src_port", 1, cfg)
+
+        lf_dest = ttk.LabelFrame(general, text="Destino")
+        lf_dest.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        self._add_entry(lf_dest, "dst_host", 0, cfg)
+        self._add_entry(lf_dest, "dst_port", 1, cfg)
+
+        lf_audio = ttk.LabelFrame(general, text="Audio")
+        lf_audio.grid(row=2, column=0, sticky="nsew", padx=8, pady=4)
+        self._add_entry(lf_audio, "codecs", 0, cfg)
+        self._add_entry(lf_audio, "rtp_port_base", 1, cfg)
+        self._add_check(lf_audio, "symmetric_rtp", 2, cfg, text="symmetric_rtp")
+        self._add_entry(lf_audio, "rtp_stats_every", 3, cfg)
+        self._add_entry(lf_audio, "tone_hz", 4, cfg)
+        self._add_check(lf_audio, "send_silence", 5, cfg, text="send_silence")
+
+        lf_mode = ttk.LabelFrame(general, text="Modo")
+        lf_mode.grid(row=3, column=0, sticky="nsew", padx=8, pady=4)
+        self.vars["role"] = tk.StringVar(value=cfg.get("role", "UAC"))
+        ttk.Radiobutton(lf_mode, text="UAC", variable=self.vars["role"], value="UAC", command=self.update_button_states).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(lf_mode, text="UAS", variable=self.vars["role"], value="UAS", command=self.update_button_states).grid(row=0, column=1, sticky="w")
+        self._add_check(lf_mode, "wait_bye", 1, cfg, text="esperar BYE")
+
+        # ------------------ Identity tab ------------------
+        identity = ttk.Frame(nb)
         nb.add(identity, text="Identidad y SIP")
+
+        lf_ft = ttk.LabelFrame(identity, text="From/To y URIs (opcional)")
+        lf_ft.grid(row=0, column=0, sticky="nsew", padx=8, pady=4)
+        self._add_entry(lf_ft, "from_number", 0, cfg)
+        self._add_entry(lf_ft, "from_domain", 1, cfg)
+        self._add_entry(lf_ft, "from_display", 2, cfg)
+        self._add_entry(lf_ft, "to_number", 3, cfg)
+        self._add_entry(lf_ft, "to_domain", 4, cfg)
+        self._add_entry(lf_ft, "from_uri", 5, cfg)
+        self._add_entry(lf_ft, "to_uri", 6, cfg)
+
+        lf_auth = ttk.LabelFrame(identity, text="Auth (opcional)")
+        lf_auth.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        self._add_check(lf_auth, "use_auth", 0, cfg, text="usar auth")
+        self._add_entry(lf_auth, "auth_user", 1, cfg)
+        self._add_entry(lf_auth, "auth_pass", 2, cfg, show="*")
+
+        # ------------------ Load tab ------------------
+        load = ttk.Frame(nb)
         nb.add(load, text="Carga")
 
-        # General tab
-        self._add_entry(general, "bind_ip", 0, cfg)
-        self._add_entry(general, "src_port", 1, cfg)
-        self._add_entry(general, "dst_host", 2, cfg)
-        self._add_entry(general, "dst_port", 3, cfg)
-        self._add_entry(general, "codecs", 4, cfg)
-        self._add_entry(general, "rtp_port_base", 5, cfg)
-        self._add_check(general, "symmetric_rtp", 6, cfg, text="symmetric_rtp")
-        self._add_entry(general, "rtp_stats_every", 7, cfg)
-        self._add_entry(general, "tone_hz", 8, cfg)
-        self._add_check(general, "send_silence", 9, cfg, text="send_silence")
-        self.vars["role"] = tk.StringVar(value=cfg.get("role", "UAC"))
-        ttk.Label(general, text="role").grid(row=10, column=0, sticky="w")
-        rb1 = ttk.Radiobutton(general, text="UAC", variable=self.vars["role"], value="UAC")
-        rb2 = ttk.Radiobutton(general, text="UAS", variable=self.vars["role"], value="UAS")
-        rb1.grid(row=10, column=1, sticky="w")
-        rb2.grid(row=10, column=2, sticky="w")
-        self._add_check(general, "wait_bye", 11, cfg, text="esperar BYE")
-
-        btn_frame = ttk.Frame(general)
-        btn_frame.grid(row=12, column=0, columnspan=3, pady=10)
-        ttk.Button(btn_frame, text="Probar OPTIONS", command=self.start_options).grid(row=0, column=0, padx=2)
-        self.uas_btn = ttk.Button(btn_frame, text="Iniciar UAS", command=self.toggle_uas)
-        self.uas_btn.grid(row=0, column=1, padx=2)
-        self.call_btn = ttk.Button(btn_frame, text="Llamada UAC", command=self.start_call)
-        self.call_btn.grid(row=0, column=2, padx=2)
-        self.load_btn = ttk.Button(btn_frame, text="Generador", command=self.start_load)
-        self.load_btn.grid(row=0, column=3, padx=2)
-        ttk.Button(btn_frame, text="Detener todo", command=self.stop_all).grid(row=0, column=4, padx=2)
-
-        # Identity tab
-        self._add_entry(identity, "from_number", 0, cfg)
-        self._add_entry(identity, "from_domain", 1, cfg)
-        self._add_entry(identity, "from_display", 2, cfg)
-        self._add_entry(identity, "to_number", 3, cfg)
-        self._add_entry(identity, "to_domain", 4, cfg)
-        self._add_entry(identity, "from_uri", 5, cfg)
-        self._add_entry(identity, "to_uri", 6, cfg)
-        self._add_check(identity, "use_auth", 7, cfg, text="usar auth")
-        self._add_entry(identity, "auth_user", 8, cfg)
-        self._add_entry(identity, "auth_pass", 9, cfg, show="*")
-
-        # Load tab
-        self._add_check(load, "load", 0, cfg, text="load")
-        self._add_entry(load, "calls", 1, cfg)
-        self._add_entry(load, "rate", 2, cfg)
-        self._add_entry(load, "max_active", 3, cfg)
-        self._add_entry(load, "from_number_start", 4, cfg)
-        self._add_entry(load, "to_number_start", 5, cfg)
-        self._add_entry(load, "number_step", 6, cfg)
-        self._add_entry(load, "pad_width", 7, cfg)
-        self._add_entry(load, "src_port_base", 8, cfg)
-        self._add_entry(load, "src_port_step", 9, cfg)
-        self._add_entry(load, "rtp_port_step", 10, cfg)
-        self._add_check(load, "ignore_health", 11, cfg, text="ignorar health")
+        lf_load = ttk.LabelFrame(load, text="Parámetros de carga")
+        lf_load.grid(row=0, column=0, sticky="nsew", padx=8, pady=4)
+        self._add_check(lf_load, "load", 0, cfg, text="load")
+        self._add_entry(lf_load, "calls", 1, cfg)
+        self._add_entry(lf_load, "rate", 2, cfg)
+        self._add_entry(lf_load, "max_active", 3, cfg)
+        self._add_entry(lf_load, "from_number_start", 4, cfg)
+        self._add_entry(lf_load, "to_number_start", 5, cfg)
+        self._add_entry(lf_load, "number_step", 6, cfg)
+        self._add_entry(lf_load, "pad_width", 7, cfg)
+        self._add_entry(lf_load, "src_port_base", 8, cfg)
+        self._add_entry(lf_load, "src_port_step", 9, cfg)
+        self._add_entry(lf_load, "rtp_port_step", 10, cfg)
+        self._add_check(lf_load, "ignore_health", 11, cfg, text="ignorar health")
         self.load_tab_btn = ttk.Button(load, text="Iniciar Generador", command=self.start_load)
-        self.load_tab_btn.grid(row=12, column=0, columnspan=2, pady=10)
+        self.load_tab_btn.grid(row=1, column=0, pady=8)
+
+        # separator and main button row
+        ttk.Separator(self, orient="horizontal").pack(fill="x", pady=4)
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(fill="x")
+        self.opt_btn = ttk.Button(btn_frame, text="Probar OPTIONS", command=self.start_options)
+        self.uas_btn = ttk.Button(btn_frame, text="Iniciar UAS", command=self.toggle_uas)
+        self.call_btn = ttk.Button(btn_frame, text="Llamada UAC", command=self.start_call)
+        self.load_btn = ttk.Button(btn_frame, text="Generador", command=self.start_load)
+        self.bye_uac_btn = ttk.Button(btn_frame, text="BYE todas (UAC)", command=self.on_bye_all_uac)
+        self.bye_uas_btn = ttk.Button(btn_frame, text="BYE todas (UAS)", command=self.on_bye_all_uas)
+        self.stop_btn = ttk.Button(btn_frame, text="Detener todo", command=self.stop_all)
+        for i, b in enumerate([self.opt_btn, self.uas_btn, self.call_btn, self.load_btn, self.bye_uac_btn, self.bye_uas_btn, self.stop_btn]):
+            b.grid(row=0, column=i, padx=2, pady=2)
 
         # Status / log
         status = ttk.Frame(self)
         status.pack(fill="both", expand=True)
-        self.options_lbl = ttk.Label(status, text="OPTIONS: -")
-        self.options_lbl.pack(anchor="w")
+        self.health_lbl = ttk.Label(status, text="Health OPTIONS", style="Status.Warn.TLabel")
+        self.health_lbl.pack(anchor="w")
+        self.uas_status_lbl = ttk.Label(status, text="UAS: PARADO", style="Status.Warn.TLabel")
+        self.uas_status_lbl.pack(anchor="w")
+        self.gen_status_lbl = ttk.Label(status, text="Generador: PARADO", style="Status.Warn.TLabel")
+        self.gen_status_lbl.pack(anchor="w")
         self.uac_lbl = ttk.Label(status, text="UAC: -")
         self.uac_lbl.pack(anchor="w")
-        self.uas_lbl = ttk.Label(status, text="UAS: parado")
+        self.uas_lbl = ttk.Label(status, text="UAS dialogs=0")
         self.uas_lbl.pack(anchor="w")
         log_frame = ttk.Frame(status)
         log_frame.pack(fill="both", expand=True)
@@ -197,17 +234,20 @@ class App(tk.Tk):
 
     # helpers -----------------------------------------------------------
     def _add_entry(self, parent, key, row, cfg, show=None):
-        ttk.Label(parent, text=key).grid(row=row, column=0, sticky="w")
+        ttk.Label(parent, text=key).grid(row=row, column=0, sticky="w", padx=8, pady=4)
         var = tk.StringVar(value=cfg.get(key, ""))
         e = ttk.Entry(parent, textvariable=var, show=show)
-        e.grid(row=row, column=1, sticky="ew", padx=2, pady=2)
+        e.grid(row=row, column=1, sticky="ew", padx=8, pady=4)
         parent.grid_columnconfigure(1, weight=1)
         self.vars[key] = var
+        self.widgets[key] = e
 
     def _add_check(self, parent, key, row, cfg, text=None):
         var = tk.BooleanVar(value=cfg.get(key, False))
-        chk = ttk.Checkbutton(parent, text=text or key, variable=var, command=self.update_button_states)
-        chk.grid(row=row, column=0, columnspan=2, sticky="w")
+        chk = ttk.Checkbutton(
+            parent, text=text or key, variable=var, command=self.update_button_states
+        )
+        chk.grid(row=row, column=0, columnspan=2, sticky="w", padx=8, pady=4)
         self.vars[key] = var
 
     # ------------------------------------------------------------------
@@ -233,20 +273,82 @@ class App(tk.Tk):
 
     def _refresh_status(self):
         o = self.state["options"]
-        self.options_lbl.config(text=f"OPTIONS sent={o['sent']} 200={o['ok']} other={o['other']} timeout={o['timeout']}")
+        style = "Status.OK.TLabel" if self.health_ok else "Status.Bad.TLabel"
+        self.health_lbl.config(
+            text=f"Health OPTIONS: {'OK' if self.health_ok else 'FAIL'}",
+            style=style,
+        )
+        counts = self.sm.active_counts()
         u = self.state["uac"]
-        self.uac_lbl.config(text=f"UAC launched={u['launched']} active={u['active']} established={u['established']} 4xx={u['failed_4xx']} 5xx={u['failed_5xx']} canceled={u['canceled']} remote_bye={u['remote_bye']}")
-        self.uas_lbl.config(text=f"UAS dialogs={self.state['uas']['dialogs']}")
+        u["active"] = counts["uac"]
+        self.uac_lbl.config(
+            text=(
+                f"UAC launched={u['launched']} active={u['active']} established={u['established']} "
+                f"4xx={u['failed_4xx']} 5xx={u['failed_5xx']} canceled={u['canceled']} remote_bye={u['remote_bye']}"
+            )
+        )
+        self.uas_lbl.config(text=f"UAS dialogs={counts['uas']}")
+        if getattr(self, "uas_thread", None) and self.uas_thread.is_alive():
+            self.uas_status_lbl.config(text="UAS: ACTIVO", style="Status.OK.TLabel")
+        else:
+            self.uas_status_lbl.config(text="UAS: PARADO", style="Status.Warn.TLabel")
+        if getattr(self, "load_thread", None) and self.load_thread.is_alive():
+            self.gen_status_lbl.config(text="Generador: EN MARCHA", style="Status.OK.TLabel")
+        else:
+            self.gen_status_lbl.config(text="Generador: PARADO", style="Status.Warn.TLabel")
 
     def update_button_states(self):
-        if self.health_ok or self.vars.get("ignore_health", tk.BooleanVar()).get():
-            state = "!disabled"
+        role = self.vars.get("role", tk.StringVar(value="UAC")).get()
+        dst = self.vars.get("dst_host", tk.StringVar()).get().strip()
+        resolvable = True
+        if not dst:
+            resolvable = False
         else:
-            state = "disabled"
-        self.load_btn.state([state])
-        self.call_btn.state([state])
+            try:
+                socket.gethostbyname(dst)
+            except OSError:
+                resolvable = False
+
+        base_enabled = self.health_ok or self.vars.get("ignore_health", tk.BooleanVar()).get()
+        if not resolvable:
+            base_enabled = False
+
+        self.opt_btn.state(["!disabled" if resolvable else "disabled"])
+
+        if role == "UAS":
+            self.call_btn.state(["disabled"])
+            for k in [
+                "from_number",
+                "from_domain",
+                "from_display",
+                "to_number",
+                "to_domain",
+                "from_uri",
+                "to_uri",
+            ]:
+                if k in self.widgets:
+                    self.widgets[k].config(state="disabled")
+        else:
+            self.call_btn.state(["!disabled" if base_enabled else "disabled"])
+            for k in [
+                "from_number",
+                "from_domain",
+                "from_display",
+                "to_number",
+                "to_domain",
+                "from_uri",
+                "to_uri",
+            ]:
+                if k in self.widgets:
+                    self.widgets[k].config(state="normal")
+
+        self.load_btn.state(["!disabled" if base_enabled else "disabled"])
         if hasattr(self, "load_tab_btn"):
-            self.load_tab_btn.state([state])
+            self.load_tab_btn.state(["!disabled" if base_enabled else "disabled"])
+
+        counts = self.sm.active_counts()
+        self.bye_uac_btn.state(["!disabled" if counts["uac"] > 0 else "disabled"])
+        self.bye_uas_btn.state(["!disabled" if counts["uas"] > 0 else "disabled"])
 
     # ------------------------------------------------------------------
     def get_config(self):
@@ -292,7 +394,9 @@ class App(tk.Tk):
 
     def start_call(self):
         cfg = self.get_config()
-        t = threading.Thread(target=call_worker, args=(cfg, self.event_q))
+        if not cfg:
+            return
+        t = threading.Thread(target=call_worker, args=(cfg, self.event_q, self.sm))
         t.daemon = True
         t.start()
 
@@ -301,9 +405,12 @@ class App(tk.Tk):
             messagebox.showwarning("Health", "OPTIONS fallido: no se puede iniciar generador")
             return
         cfg = self.get_config()
-        t = threading.Thread(target=load_worker, args=(cfg, self.event_q, self.stop_event))
+        if not cfg:
+            return
+        t = threading.Thread(target=load_worker, args=(cfg, self.event_q, self.stop_event, self.sm))
         t.daemon = True
         t.start()
+        self.load_thread = t
 
     def toggle_uas(self):
         if getattr(self, "uas_thread", None) and self.uas_thread.is_alive():
@@ -313,13 +420,38 @@ class App(tk.Tk):
             self.uas_btn.config(text="Iniciar UAS")
         else:
             cfg = self.get_config()
+            if not cfg:
+                return
             self.stop_event.clear()
-            self.uas_thread = threading.Thread(target=uas_worker, args=(cfg, self.event_q, self.stop_event), daemon=True)
+            self.uas_thread = threading.Thread(
+                target=uas_worker, args=(cfg, self.event_q, self.stop_event), daemon=True
+            )
             self.uas_thread.start()
             self.uas_btn.config(text="Detener UAS")
 
     def stop_all(self):
         self.stop_event.set()
+        if getattr(self, "load_thread", None):
+            self.load_thread.join(timeout=1)
+            self.load_thread = None
+        if getattr(self, "uas_thread", None):
+            self.uas_thread.join(timeout=1)
+            self.uas_thread = None
+            self.uas_btn.config(text="Iniciar UAS")
+        # send BYE for any pending dialogs
+        self.sm.bye_all("uac")
+        self.sm.bye_all("uas")
+        self.update_button_states()
+
+    def on_bye_all_uac(self):
+        t = threading.Thread(target=bye_all_worker, args=(self.sm, "uac", self.event_q))
+        t.daemon = True
+        t.start()
+
+    def on_bye_all_uas(self):
+        t = threading.Thread(target=bye_all_worker, args=(self.sm, "uas", self.event_q))
+        t.daemon = True
+        t.start()
 
     def save_log(self):
         path = filedialog.asksaveasfilename(defaultextension=".log")
@@ -330,7 +462,9 @@ class App(tk.Tk):
     def on_close(self):
         if messagebox.askokcancel("Salir", "¿Cerrar la aplicación?"):
             self.stop_all()
-            save_config(self.get_config())
+            cfg = self.get_config()
+            if cfg:
+                save_config(cfg)
             self.destroy()
 
 
@@ -358,7 +492,7 @@ def options_worker(cfg, event_q):
     event_q.put(("log", "OPTIONS test finished"))
 
 
-def call_worker(cfg, event_q):
+def call_worker(cfg, event_q, sm):
     counters = {
         "launched": 1,
         "active": 1,
@@ -369,7 +503,6 @@ def call_worker(cfg, event_q):
         "remote_bye": 0,
     }
     event_q.put(("uac", counters.copy()))
-    sm = SIPManager(protocol="udp")
     dst = cfg.get("dst_host")
     dport = int(cfg.get("dst_port", 5060))
     try:
@@ -405,7 +538,7 @@ def call_worker(cfg, event_q):
     event_q.put(("log", f"Call result: {result}"))
 
 
-def load_worker(cfg, event_q, stop_event):
+def load_worker(cfg, event_q, stop_event, sm):
     args = SimpleNamespace(
         dst=cfg.get("dst_host"),
         dst_port=int(cfg.get("dst_port", 5060)),
@@ -440,8 +573,6 @@ def load_worker(cfg, event_q, stop_event):
         rate=float(cfg.get("rate", "1.0")),
         max_active=int(cfg.get("max_active", "1")),
     )
-    sm = SIPManager(protocol="udp")
-
     def stats_cb(snapshot):
         event_q.put(("uac", snapshot))
 
@@ -456,6 +587,11 @@ def uas_worker(cfg, event_q, stop_event):
             time.sleep(0.5)
     finally:
         event_q.put(("log", "UAS service stopped"))
+
+
+def bye_all_worker(sm, role, event_q):
+    count = sm.bye_all(role)
+    event_q.put(("log", f"bye_all({role}) sent {count} BYE(s)"))
 
 
 def main(args=None):

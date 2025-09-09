@@ -41,7 +41,13 @@ La opción `--gui` abre una ventana sencilla para configurar y ejecutar pruebas 
 python app.py --gui
 ```
 
-La interfaz se organiza en tres pestañas (General, Identidad/SIP y Carga) y un panel inferior de estado con contadores y un visor de logs. Desde los botones se pueden lanzar pruebas de OPTIONS, iniciar un UAS básico, realizar una llamada individual o arrancar el generador de carga. El log mostrado en pantalla puede guardarse a archivo mediante el botón "Guardar log...".
+La interfaz se organiza en tres pestañas (General, Identidad/SIP y Carga) agrupadas mediante `LabelFrame` y un panel inferior de estado con *badges* de salud. Desde la botonera siempre visible se pueden lanzar pruebas de OPTIONS, iniciar o detener un UAS básico, realizar una llamada individual mediante **Llamada UAC** o arrancar el generador de carga. Los botones **BYE todas (UAC)** y **BYE todas (UAS)** permiten cerrar de forma masiva los diálogos activos de cada rol. El log mostrado en pantalla puede guardarse a archivo mediante el botón "Guardar log...".
+
+Botones principales:
+
+- **Llamada UAC**: envía una sola llamada usando los parámetros actuales.
+- **Generador**: lanza múltiples llamadas consecutivas según la configuración de la pestaña "Carga".
+- **BYE todas (UAC/UAS)**: envía BYE a todos los diálogos activos del rol correspondiente.
 
 ## Instalación en Ubuntu
 
