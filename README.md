@@ -358,3 +358,14 @@ python app.py --invite --dst 1.2.3.4 --codecs g729 --allow-unsupported-codecs
 Si un UAS remoto responde `200 OK` seleccionando un códec fuera de {0,8}, el
 UAC registrará un WARNING `unsupported negotiated codec`, enviará el ACK
 obligatorio y luego un BYE inmediato sin iniciar RTP.
+
+### Troubleshooting: `sent=0` `recv>0`
+
+Si las métricas de RTP muestran paquetes recibidos pero ninguno enviado:
+
+1. Activa un tono con `--rtp-tone` o habilita el envío de silencio con
+   `--rtp-send-silence`/`--rtp-always-silence`.
+2. Si no conoces la IP:puerto remotos, utiliza `--symmetric-rtp` para que el
+   emisor aprenda el destino al recibir el primer paquete.
+3. Verifica con `tcpdump` el tráfico en los puertos RTP/RTCP correspondientes
+   para confirmar la dirección y si hay bloqueos de red.

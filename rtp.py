@@ -145,6 +145,17 @@ class RtpSession:
         self.remote_addr = (
             (remote_ip, remote_port) if remote_ip and remote_port else None
         )
+        logger.info(
+            "RTP start: remote=%s:%s pt=%s tone=%s silence=%s symmetric=%s",
+            remote_ip,
+            remote_port,
+            self.pt,
+            self.tone_hz or 0,
+            self.send_silence,
+            self.symmetric,
+        )
+        if (remote_port in (None, 0) or not remote_ip) and not self.symmetric:
+            logger.warning("No remote RTP port specified and symmetric-rtp disabled")
         if self.save_wav:
             self.wav_file = open(self.save_wav, "wb")
             write_wav_header(self.wav_file, 0)
@@ -152,7 +163,13 @@ class RtpSession:
         self.start_time = time.time()
         self.recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self.recv_thread.start()
+        start_sender = False
         if self.tone_hz or self.send_silence:
+            if self.remote_addr or self.symmetric:
+                start_sender = True
+            elif not self.remote_addr and not self.symmetric:
+                logger.warning("RTP sender not started: no remote address")
+        if start_sender:
             self.send_thread = threading.Thread(target=self._send_loop, daemon=True)
             self.send_thread.start()
         if self.stats_interval > 0:
@@ -248,7 +265,10 @@ class RtpSession:
             except OSError:
                 break
             if self.symmetric and not self.remote_addr:
-                self.remote_addr = addr
+                self.set_remote(addr[0], addr[1])
+                logger.info(
+                    "RTP learned remote=%s:%s (symmetric)", addr[0], addr[1]
+                )
             if len(data) < 12:
                 continue
             seq = struct.unpack("!H", data[2:4])[0]
