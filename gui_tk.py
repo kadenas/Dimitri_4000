@@ -18,6 +18,7 @@ CONFIG_PATH = os.path.expanduser("~/.dimitri4000.json")
 DEFAULT_CONFIG = {
     "bind_ip": "",
     "src_port": "0",
+    "use_src_port_options": True,
     "dst_host": "127.0.0.1",
     "dst_port": "5060",
     "codecs": "pcmu,pcma",
@@ -38,6 +39,7 @@ DEFAULT_CONFIG = {
     "auth_pass": "",
     "use_auth": False,
     "wait_bye": True,
+    "require_health_call": True,
     # load
     "load": False,
     "calls": "1",
@@ -132,6 +134,13 @@ class App(tk.Tk):
         lf_origen.grid(row=0, column=0, sticky="nsew", padx=8, pady=4)
         self._add_entry(lf_origen, "bind_ip", 0, cfg)
         self._add_entry(lf_origen, "src_port", 1, cfg)
+        self._add_check(
+            lf_origen,
+            "use_src_port_options",
+            2,
+            cfg,
+            text="usar src_port para OPTIONS",
+        )
 
         lf_dest = ttk.LabelFrame(general, text="Destino")
         lf_dest.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
@@ -153,6 +162,13 @@ class App(tk.Tk):
         ttk.Radiobutton(lf_mode, text="UAC", variable=self.vars["role"], value="UAC", command=self.update_button_states).grid(row=0, column=0, sticky="w")
         ttk.Radiobutton(lf_mode, text="UAS", variable=self.vars["role"], value="UAS", command=self.update_button_states).grid(row=0, column=1, sticky="w")
         self._add_check(lf_mode, "wait_bye", 1, cfg, text="esperar BYE")
+        self._add_check(
+            lf_mode,
+            "require_health_call",
+            2,
+            cfg,
+            text="exigir health para llamadas",
+        )
 
         # ------------------ Identity tab ------------------
         identity = ttk.Frame(nb)
@@ -212,7 +228,9 @@ class App(tk.Tk):
         # Status / log
         status = ttk.Frame(self)
         status.pack(fill="both", expand=True)
-        self.health_lbl = ttk.Label(status, text="Health OPTIONS", style="Status.Warn.TLabel")
+        self.health_lbl = ttk.Label(
+            status, text="health: FAIL", style="Status.Bad.TLabel"
+        )
         self.health_lbl.pack(anchor="w")
         self.uas_status_lbl = ttk.Label(status, text="UAS: PARADO", style="Status.Warn.TLabel")
         self.uas_status_lbl.pack(anchor="w")
@@ -272,10 +290,9 @@ class App(tk.Tk):
         self.after(200, self._process_events)
 
     def _refresh_status(self):
-        o = self.state["options"]
         style = "Status.OK.TLabel" if self.health_ok else "Status.Bad.TLabel"
         self.health_lbl.config(
-            text=f"Health OPTIONS: {'OK' if self.health_ok else 'FAIL'}",
+            text=f"health: {'OK' if self.health_ok else 'FAIL'}",
             style=style,
         )
         counts = self.sm.active_counts()
@@ -300,6 +317,7 @@ class App(tk.Tk):
     def update_button_states(self):
         role = self.vars.get("role", tk.StringVar(value="UAC")).get()
         dst = self.vars.get("dst_host", tk.StringVar()).get().strip()
+        dport = self.vars.get("dst_port", tk.StringVar()).get().strip()
         resolvable = True
         if not dst:
             resolvable = False
@@ -308,12 +326,16 @@ class App(tk.Tk):
                 socket.gethostbyname(dst)
             except OSError:
                 resolvable = False
-
-        base_enabled = self.health_ok or self.vars.get("ignore_health", tk.BooleanVar()).get()
-        if not resolvable:
-            base_enabled = False
+        dest_ok = resolvable and dport.isdigit()
 
         self.opt_btn.state(["!disabled" if resolvable else "disabled"])
+
+        base_enabled = self.health_ok or self.vars.get("ignore_health", tk.BooleanVar()).get()
+        if not dest_ok:
+            base_enabled = False
+        self.load_btn.state(["!disabled" if base_enabled else "disabled"])
+        if hasattr(self, "load_tab_btn"):
+            self.load_tab_btn.state(["!disabled" if base_enabled else "disabled"])
 
         if role == "UAS":
             self.call_btn.state(["disabled"])
@@ -329,7 +351,6 @@ class App(tk.Tk):
                 if k in self.widgets:
                     self.widgets[k].config(state="disabled")
         else:
-            self.call_btn.state(["!disabled" if base_enabled else "disabled"])
             for k in [
                 "from_number",
                 "from_domain",
@@ -341,10 +362,17 @@ class App(tk.Tk):
             ]:
                 if k in self.widgets:
                     self.widgets[k].config(state="normal")
-
-        self.load_btn.state(["!disabled" if base_enabled else "disabled"])
-        if hasattr(self, "load_tab_btn"):
-            self.load_tab_btn.state(["!disabled" if base_enabled else "disabled"])
+            to_uri = self.vars.get("to_uri", tk.StringVar()).get().strip()
+            to_number = self.vars.get("to_number", tk.StringVar()).get().strip()
+            to_domain = self.vars.get("to_domain", tk.StringVar()).get().strip()
+            identity_ok = bool(to_uri) or (to_number and to_domain)
+            call_enabled = dest_ok and identity_ok
+            if (
+                self.vars.get("require_health_call", tk.BooleanVar(value=True)).get()
+                and not self.health_ok
+            ):
+                call_enabled = False
+            self.call_btn.state(["!disabled" if call_enabled else "disabled"])
 
         counts = self.sm.active_counts()
         self.bye_uac_btn.state(["!disabled" if counts["uac"] > 0 else "disabled"])
@@ -380,7 +408,9 @@ class App(tk.Tk):
                     rtp += 1
                     cfg["rtp_port_base"] = str(rtp)
                     self.vars["rtp_port_base"].set(cfg["rtp_port_base"])
-                    messagebox.showinfo("RTP", "rtp_port_base debe ser par; ajustado")
+                    logging.info(
+                        "rtp_port_base debe ser par; ajustado a %s", rtp
+                    )
         except ValueError as exc:
             messagebox.showerror("Valor inválido", str(exc))
             return None
@@ -473,12 +503,26 @@ def options_worker(cfg, event_q):
     sm = SIPManager(protocol="udp")
     dst = cfg.get("dst_host")
     dport = int(cfg.get("dst_port", 5060))
+    bind_ip = cfg.get("bind_ip") or None
+    src_port = int(cfg.get("src_port", "0") or 0)
+    if not cfg.get("use_src_port_options", True):
+        src_port = 0
     for _ in range(3):
         counters["sent"] += 1
         try:
-            code, _, _ = sm.send_request(dst_host=dst, dst_port=dport)
+            code, _, _ = sm.send_request(
+                dst_host=dst,
+                dst_port=dport,
+                bind_ip=bind_ip,
+                bind_port=src_port,
+            )
         except OSError as exc:
-            event_q.put(("log", f"OPTIONS error: {exc}"))
+            if getattr(exc, "errno", None) == 111:
+                event_q.put(
+                    ("log", f"Destino no escucha en {dst}:{dport}")
+                )
+            else:
+                event_q.put(("log", f"OPTIONS error: {exc}"))
             counters["other"] += 1
         else:
             if code is None:

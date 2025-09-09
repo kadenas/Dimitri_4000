@@ -434,18 +434,22 @@ class SIPManager:
         if self.protocol != "udp":
             raise NotImplementedError("Solo UDP por ahora.")
 
-        try:
-            s, local_ip, local_port = self._open_connected_udp(
-                dst_host, dst_port, bind_ip, bind_port
-            )
-        except OSError as e:
-            logger.error(
-                f"No se pudo bindear UDP en {bind_ip or '0.0.0.0'}:{bind_port}: {e}"
-            )
-            raise
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if bind_ip or bind_port:
+            try:
+                s.bind((bind_ip or "0.0.0.0", bind_port))
+            except OSError as e:
+                logger.error(
+                    f"No se pudo bindear UDP en {bind_ip or '0.0.0.0'}:{bind_port}: {e}"
+                )
+                s.close()
+                raise
 
         s.settimeout(timeout)
 
+        s.connect((dst_host, dst_port))
+        local_ip, local_port = s.getsockname()
         _call_id, payload = build_options(dst_host, local_ip, local_port, user, cseq)
 
         t0 = time.time()
