@@ -5,7 +5,8 @@ import time
 import uuid
 import hashlib
 import secrets
-from typing import Tuple
+from dataclasses import dataclass
+from typing import Dict, Tuple
 from rtp import RtpSession
 from sdp import build_sdp, parse_sdp, CODEC_NAME_FROM_PT
 
@@ -359,6 +360,24 @@ def build_bye(dialog: dict) -> bytes:
     return msg.encode()
 
 
+@dataclass
+class Dialog:
+    """Simple representation of an established SIP dialog."""
+
+    local_tag: str
+    remote_tag: str
+    call_id: str
+    from_uri: str
+    to_uri: str
+    route_set: list[str]
+    remote_target: str
+    sock: socket.socket
+    our_next_cseq: int
+    local_ip: str
+    local_port: int
+    role: str
+
+
 def parse_headers(data: bytes):
     """Parsea cabeceras SIP mínimas y devuelve (start_line, dict)."""
     try:
@@ -380,6 +399,9 @@ def parse_headers(data: bytes):
 class SIPManager:
     def __init__(self, protocol: str = "udp"):
         self.protocol = protocol
+        # dialogs indexed by Call-ID for UAC and UAS roles
+        self.dialogs_uac: Dict[str, Dialog] = {}
+        self.dialogs_uas: Dict[str, Dialog] = {}
 
     def _open_connected_udp(
         self,
@@ -892,6 +914,24 @@ class SIPManager:
                     rtp.start(remote_ip, remote_port)
                     s.send(ack)
                     call_established = True
+                    # register dialog for possible later BYE from GUI/load
+                    remote_tag = ""
+                    if "tag=" in to_header:
+                        remote_tag = to_header.split("tag=")[1].split(";", 1)[0]
+                    self.dialogs_uac[call_id] = Dialog(
+                        local_tag=tag,
+                        remote_tag=remote_tag,
+                        call_id=call_id,
+                        from_uri=from_uri,
+                        to_uri=to_uri,
+                        route_set=route_set.copy(),
+                        remote_target=remote_target,
+                        sock=s,
+                        our_next_cseq=invite_cseq + 1,
+                        local_ip=local_ip,
+                        local_port=local_port,
+                        role="uac",
+                    )
                     talk_start = time.monotonic()
                     if wait_bye:
                         s.settimeout(0.5)
@@ -994,6 +1034,7 @@ class SIPManager:
                     pass
             result = "aborted"
         finally:
+            self.dialogs_uac.pop(call_id, None)
             s.close()
             if 'rtp' in locals():
                 rtp.stop()
@@ -1003,3 +1044,62 @@ class SIPManager:
         else:
             talk_s = 0
         return call_id, result, setup_ms or 0, talk_s
+
+    # ------------------------------------------------------------------
+    def bye_all(self, role: str, timeout: float = 3.0) -> int:
+        """Send BYE to all active dialogs for the given role.
+
+        Parameters
+        ----------
+        role: str
+            Either "uac" or "uas".
+        timeout: float
+            How long to wait for each 200 OK response.
+
+        Returns
+        -------
+        int
+            Number of BYEs attempted.
+        """
+
+        role = role.lower()
+        dialogs = self.dialogs_uac if role == "uac" else self.dialogs_uas
+        count = 0
+        for key, d in list(dialogs.items()):
+            branch = "z9hG4bK" + uuid.uuid4().hex
+            lines = [
+                f"BYE {d.remote_target} SIP/2.0\r\n",
+                f"Via: SIP/2.0/UDP {d.local_ip}:{d.local_port};branch={branch};rport\r\n",
+                "Max-Forwards: 70\r\n",
+                f"From: <{d.from_uri}>;tag={d.local_tag}\r\n",
+                f"To: <{d.to_uri}>;tag={d.remote_tag}\r\n",
+                f"Call-ID: {d.call_id}\r\n",
+                f"CSeq: {d.our_next_cseq} BYE\r\n",
+                f"Contact: <{d.from_uri}>\r\n",
+                "User-Agent: Dimitri-4000/0.1\r\n",
+            ]
+            for r in d.route_set:
+                lines.append(f"Route: {r}\r\n")
+            lines.append("Content-Length: 0\r\n\r\n")
+            msg = "".join(lines).encode()
+            try:
+                d.sock.send(msg)
+                d.sock.settimeout(timeout)
+                try:
+                    while True:
+                        data = d.sock.recv(4096)
+                        code, _ = status_from_response(data)
+                        if code == 200:
+                            break
+                except socket.timeout:
+                    pass
+            except OSError:
+                pass
+            finally:
+                dialogs.pop(key, None)
+                count += 1
+        return count
+
+    def active_counts(self) -> dict:
+        """Return a dictionary with active dialog counts."""
+        return {"uac": len(self.dialogs_uac), "uas": len(self.dialogs_uas)}
