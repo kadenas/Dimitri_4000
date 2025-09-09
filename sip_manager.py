@@ -868,8 +868,8 @@ class SIPManager:
                         tag,
                         contact_user,
                     )
-                    s.send(ack)
                     if payload_pt not in (0, 8):
+                        s.send(ack)
                         logger.warning("unsupported negotiated codec")
                         invite_cseq = send_bye(invite_cseq + 1)
                         result = "unsupported-codec"
@@ -886,7 +886,11 @@ class SIPManager:
                     rtp.tone_hz = tone_hz
                     rtp.send_silence = send_silence and not tone_hz
                     rtp.stats_interval = stats_interval
+                    logger.info(
+                        "Starting RTP to %s:%s", remote_ip, remote_port
+                    )
                     rtp.start(remote_ip, remote_port)
+                    s.send(ack)
                     call_established = True
                     talk_start = time.monotonic()
                     if wait_bye:

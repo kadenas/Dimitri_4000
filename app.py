@@ -142,6 +142,11 @@ def parse_args():
     p.add_argument("--rtcp", action="store_true", help="Abrir puerto RTCP")
     p.add_argument("--rtp-tone", type=int, help="Enviar tono continuo (Hz)")
     p.add_argument("--rtp-send-silence", action="store_true", help="Enviar silencio si no hay tono")
+    p.add_argument(
+        "--rtp-always-silence",
+        action="store_true",
+        help="Forzar envío de silencio si no se especifica tono",
+    )
     p.add_argument("--symmetric-rtp", action="store_true", help="Aprender IP:puerto remoto de RTP")
     p.add_argument("--rtp-save-wav", help="Guardar audio recibido a WAV")
     p.add_argument(
@@ -321,7 +326,7 @@ def run_load_generator(args, sip_manager, stats_cb=None):
                     rtp_port_forced=True,
                     rtcp=args.rtcp,
                     tone_hz=args.rtp_tone,
-                    send_silence=args.rtp_send_silence,
+                    send_silence=(args.rtp_send_silence or args.rtp_always_silence),
                     symmetric=args.symmetric_rtp,
                     stats_interval=args.rtp_stats_every,
                 )
@@ -506,7 +511,7 @@ def main():
                 rtp_port_forced=args.rtp_port_forced,
                 rtcp=args.rtcp,
                 tone_hz=args.rtp_tone,
-                send_silence=args.rtp_send_silence,
+                send_silence=(args.rtp_send_silence or args.rtp_always_silence),
                 symmetric=args.symmetric_rtp,
                 save_wav=args.rtp_save_wav,
                 stats_interval=args.rtp_stats_every,
@@ -836,19 +841,32 @@ def main():
                                     elif dialog.get("state") == "answered":
                                         dialog["state"] = "established"
                                         cancel_events(key, ["200_retx", "timer_m"])
-                                        rip, rport = dialog.get("remote_rtp", (None, None))
+                                        body = b""
+                                        if b"\r\n\r\n" in data:
+                                            body = data.split(b"\r\n\r\n", 1)[1]
+                                        if body:
+                                            sdp_info = parse_sdp(body)
+                                            rip = sdp_info.get("ip")
+                                            rport = sdp_info.get("audio_port")
+                                            dialog["remote_rtp"] = (rip, rport)
+                                        else:
+                                            rip, rport = dialog.get("remote_rtp", (None, None))
                                         pt_use = dialog.get("pt", first_pt)
+                                        sym = args.symmetric_rtp or not (rip and rport)
                                         rtp = RtpSession(
                                             dialog["local_ip"],
                                             args.rtp_port,
                                             pt_use,
-                                            symmetric=args.symmetric_rtp,
+                                            symmetric=sym,
                                             save_wav=args.rtp_save_wav,
                                             forced=args.rtp_port_forced,
                                         )
                                         rtp.rtcp = args.rtcp
                                         rtp.tone_hz = args.rtp_tone
-                                        rtp.send_silence = args.rtp_send_silence and not args.rtp_tone
+                                        rtp.send_silence = (
+                                            (args.rtp_send_silence or args.rtp_always_silence)
+                                            and not args.rtp_tone
+                                        )
                                         rtp.stats_interval = args.rtp_stats_every
                                         rtp.start(rip, rport)
                                         dialog["rtp"] = rtp
