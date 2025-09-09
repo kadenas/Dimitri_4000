@@ -156,6 +156,23 @@ def parse_args():
         "--auth-username",
         help="Username para Digest si distinto del número de usuario",
     )
+    # Load generator options
+    p.add_argument("--load", action="store_true", help="Activa generador de llamadas")
+    p.add_argument("--calls", type=int, default=1, help="Cuántas llamadas lanzar en total")
+    p.add_argument("--rate", type=float, default=1.0, help="Llamadas por segundo")
+    p.add_argument("--max-active", type=int, help="Máximo de llamadas simultáneas")
+    p.add_argument("--from-number-start", help="Número From inicial")
+    p.add_argument("--to-number-start", help="Número To inicial")
+    p.add_argument("--number-step", type=int, default=1, help="Incremento por llamada")
+    p.add_argument("--pad-width", type=int, default=0, help="Ancho con padding de ceros")
+    p.add_argument("--to-domain-load", help="Dominio To para modo carga")
+    p.add_argument("--from-domain-load", help="Dominio From para modo carga")
+    p.add_argument("--to-uri-pattern", help="Plantilla de URI destino (sip:{num}@{host})")
+    p.add_argument("--src-port-base", type=int, default=0, help="Puerto SIP origen base")
+    p.add_argument("--src-port-step", type=int, default=10, help="Incremento puerto SIP")
+    p.add_argument("--rtp-port-base", type=int, default=40000, help="Primer puerto RTP local")
+    p.add_argument("--rtp-port-step", type=int, default=2, help="Incremento puerto RTP")
+
     # Compatibilidad con la CLI antigua: host [port]
     p.add_argument("host", nargs="?", help="Destino (compat)")
     p.add_argument("port", nargs="?", type=int, help="Puerto destino (compat)")
@@ -208,11 +225,196 @@ def parse_args():
             logger.warning("--prefer %s ignorado; no está en --codecs", args.prefer)
             args.prefer = None
 
+    # defaults for load generator
+    if args.max_active is None:
+        args.max_active = args.calls
+    if args.to_domain_load is None:
+        args.to_domain_load = args.to_domain or args.dst
+    if args.from_domain_load is None:
+        args.from_domain_load = args.from_domain or args.bind_ip
+
     return args
 
 
+def run_load_generator(args, sip_manager):
+    """Generate many calls with controlled rate and incremental parameters."""
+    import threading
+    from datetime import datetime, UTC
+    import time
+    import errno
+
+    counters = {
+        "launched": 0,
+        "established": 0,
+        "failed_4xx": 0,
+        "failed_5xx_6xx": 0,
+        "canceled": 0,
+        "remote_bye": 0,
+        "max_time_bye": 0,
+        "aborted": 0,
+    }
+    active = set()
+    lock = threading.Lock()
+
+    if not args.to_uri_pattern and not args.to_number_start:
+        raise SystemExit("--to-number-start requerido si no se usa --to-uri-pattern")
+
+    dst = args.dst or args.host
+    dport = args.dst_port if args.dst else (args.port or 5060)
+
+    to_start = int(args.to_number_start or 0)
+    from_start = int(args.from_number_start or 0)
+
+    def format_num(num):
+        return str(num).zfill(args.pad_width) if args.pad_width > 0 else str(num)
+
+    def worker(i):
+        nonlocal counters
+        num_to = format_num(to_start + i * args.number_step)
+        if args.to_uri_pattern:
+            to_uri = args.to_uri_pattern.format(num=num_to, host=args.to_domain_load)
+            to_number = None
+        else:
+            to_uri = None
+            to_number = num_to
+        if args.from_number_start:
+            num_from = format_num(from_start + i * args.number_step)
+        else:
+            num_from = args.from_number or args.from_user
+        src_port = args.src_port_base + i * args.src_port_step if args.src_port_base else 0
+        rtp_port = args.rtp_port_base + i * args.rtp_port_step
+        if rtp_port % 2:
+            rtp_port += 1
+        ts = datetime.now(UTC).isoformat()
+        attempts = 0
+        while True:
+            try:
+                call_id, result, setup_ms, _ = sip_manager.place_call(
+                    dst_host=dst,
+                    dst_port=dport,
+                    from_number=num_from,
+                    from_domain=args.from_domain_load,
+                    to_number=to_number,
+                    to_domain=args.to_domain_load,
+                    to_uri=to_uri,
+                    bind_ip=args.bind_ip,
+                    bind_port=src_port,
+                    timeout=args.timeout,
+                    ring_timeout=args.ring_timeout,
+                    talk_time=args.talk_time,
+                    wait_bye=args.wait_bye,
+                    max_call_time=args.max_call_time,
+                    codecs=args.codecs,
+                    rtp_port=rtp_port,
+                    rtp_port_forced=True,
+                    rtcp=args.rtcp,
+                    tone_hz=args.rtp_tone,
+                    send_silence=args.rtp_send_silence,
+                    symmetric=args.symmetric_rtp,
+                    stats_interval=args.rtp_stats_every,
+                )
+                break
+            except OSError as e:
+                if e.errno == errno.EADDRINUSE and attempts < 5:
+                    src_port = src_port + args.src_port_step if args.src_port_base else 0
+                    rtp_port += args.rtp_port_step
+                    attempts += 1
+                    continue
+                call_id = ""
+                result = f"error({e.errno})"
+                setup_ms = 0
+                break
+        from_uri = (
+            args.from_uri
+            or (f"sip:{num_from}@{args.from_domain_load}" if num_from else "")
+        )
+        final_to_uri = to_uri or f"sip:{num_to}@{args.to_domain_load}"
+        write_csv_row(
+            "calls_summary.csv",
+            [ts, call_id, from_uri, final_to_uri, src_port, rtp_port, setup_ms, result],
+            [
+                "ts_start",
+                "call_id",
+                "from_uri",
+                "to_uri",
+                "src_port",
+                "rtp_port",
+                "setup_ms",
+                "result",
+            ],
+        )
+        with lock:
+            if result in ("answered", "remote-bye", "max-time-bye"):
+                counters["established"] += 1
+            if result.startswith("busy") or result.startswith("rejected(4"):
+                counters["failed_4xx"] += 1
+            if result.startswith("rejected(5") or result.startswith("rejected(6"):
+                counters["failed_5xx_6xx"] += 1
+            if result.startswith("canceled"):
+                counters["canceled"] += 1
+            if result == "remote-bye":
+                counters["remote_bye"] += 1
+            if result == "max-time-bye":
+                counters["max_time_bye"] += 1
+            if result == "aborted":
+                counters["aborted"] += 1
+            active.discard(threading.current_thread())
+
+    stop = threading.Event()
+
+    def printer():
+        while not stop.is_set():
+            with lock:
+                line = (
+                    f"[LOAD] active={len(active)} launched={counters['launched']} "
+                    f"established={counters['established']} 4xx={counters['failed_4xx']} "
+                    f"5xx={counters['failed_5xx_6xx']} canceled={counters['canceled']} "
+                    f"remote_bye={counters['remote_bye']}"
+                )
+            print(line)
+            if stop.wait(2):
+                break
+
+    printer_t = threading.Thread(target=printer, daemon=True)
+    printer_t.start()
+
+    start = time.monotonic()
+    threads: list[threading.Thread] = []
+    try:
+        for i in range(args.calls):
+            while True:
+                with lock:
+                    if len(active) < args.max_active:
+                        break
+                time.sleep(0.05)
+            target_time = start + i * (1 / args.rate if args.rate > 0 else 0)
+            now = time.monotonic()
+            if target_time > now:
+                time.sleep(target_time - now)
+            t = threading.Thread(target=worker, args=(i,))
+            with lock:
+                counters["launched"] += 1
+                active.add(t)
+            t.start()
+            threads.append(t)
+    except KeyboardInterrupt:
+        print("Interrumpido, esperando a las llamadas activas...")
+
+    for t in threads:
+        t.join()
+    stop.set()
+    printer_t.join()
+    return counters
+
 def main():
     args = parse_args()
+
+    if args.load:
+        if not (args.dst or args.host):
+            raise SystemExit("Falta destino: usa --dst 10.0.0.1")
+        sm = SIPManager(protocol=args.protocol)
+        run_load_generator(args, sm)
+        return
 
     if args.uas and not args.service:
         args.service = True

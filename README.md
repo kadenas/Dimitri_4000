@@ -270,6 +270,28 @@ PY
 Este ejemplo crea un `SIPManager`, envía un INVITE y muestra la respuesta y el
 tiempo empleado.
 
+## Pruebas de carga
+
+El modo `--load` permite lanzar múltiples llamadas INVITE de forma secuencial
+o concurrente con numeración y puertos incrementales.
+
+```bash
+python app.py --load --calls 10 --rate 1 --wait-bye \
+  --dst 192.168.0.137 --dst-port 5062 \
+  --src-port-base 5060 --rtp-port-base 40000 \
+  --to-number-start 2000 --to-domain-load 192.168.0.137 \
+  --from-number-start 1000 --from-domain-load pbx.local
+```
+
+Cada llamada se mantiene activa hasta recibir un `BYE` remoto (o hasta
+`--max-call-time`). El resultado de cada intento queda registrado en
+`calls_summary.csv`.
+
+Advertencias:
+
+- Asegúrate de aumentar `ulimit -n` si planeas muchas llamadas simultáneas.
+- Comprueba las reglas de firewall y NAT para los puertos SIP/RTP utilizados.
+
 ## RTP básico
 
 Soporte RTP sencillo está disponible para los códecs PCMU/PCMA. Se pueden
