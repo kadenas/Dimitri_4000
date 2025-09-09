@@ -5,12 +5,32 @@ import time
 import uuid
 import hashlib
 import secrets
-from typing import Tuple
+from dataclasses import dataclass
+from typing import Dict, Tuple
 from rtp import RtpSession
 from sdp import build_sdp, parse_sdp, CODEC_NAME_FROM_PT
 
 logger = logging.getLogger("socket_handler")
 
+
+@dataclass
+class Dialog:
+    """Minimal information to send a BYE later."""
+
+    local_tag: str
+    remote_tag: str
+    call_id: str
+    route_set: list[str]
+    remote_target: str
+    sock: socket.socket
+    our_next_cseq: int
+    to_header: str
+    from_uri: str
+    from_display: str | None
+    contact_user: str
+    local_ip: str
+    local_port: int
+    role: str
 
 def normalize_number(s: str) -> str:
     """Return the number normalized removing spaces/hyphens."""
@@ -380,6 +400,10 @@ def parse_headers(data: bytes):
 class SIPManager:
     def __init__(self, protocol: str = "udp"):
         self.protocol = protocol
+        # Track active dialogs for UAC and UAS so that the GUI can issue
+        # BYE requests to all of them when needed.
+        self.dialogs_uac: Dict[str, Dialog] = {}
+        self.dialogs_uas: Dict[str, Dialog] = {}
 
     def _open_connected_udp(
         self,
@@ -442,6 +466,64 @@ class SIPManager:
         finally:
             logger.info("Socket UDP cerrado")
             s.close()
+
+    # ------------------------------------------------------------------
+    def bye_all(self, role: str, timeout: float = 3.0) -> int:
+        """Send BYE to all dialogs of the given role (``uac`` or ``uas``)."""
+        role = role.lower()
+        dialogs = self.dialogs_uac if role == "uac" else self.dialogs_uas
+        count = 0
+        for key, dlg in list(dialogs.items()):
+            try:
+                if role == "uac":
+                    bye = build_bye_request(
+                        dlg.remote_target,
+                        dlg.to_header,
+                        dlg.local_ip,
+                        dlg.local_port,
+                        dlg.from_uri,
+                        dlg.from_display,
+                        dlg.call_id,
+                        dlg.our_next_cseq,
+                        dlg.local_tag,
+                        dlg.contact_user,
+                        route_set=dlg.route_set,
+                    )
+                else:
+                    bye = build_bye(
+                        {
+                            "local_ip": dlg.local_ip,
+                            "local_port": dlg.local_port,
+                            "peer_uri": dlg.remote_target,
+                            "to_uri": dlg.from_uri,
+                            "from_uri": dlg.to_header,
+                            "call_id": dlg.call_id,
+                            "our_next_cseq": dlg.our_next_cseq,
+                            "local_tag": dlg.local_tag,
+                        }
+                    )
+                dlg.sock.send(bye)
+                dlg.sock.settimeout(timeout)
+                try:
+                    while True:
+                        data = dlg.sock.recv(4096)
+                        code, _ = status_from_response(data)
+                        if code == 200:
+                            break
+                except socket.timeout:
+                    pass
+            finally:
+                try:
+                    dlg.sock.close()
+                except Exception:
+                    pass
+                dialogs.pop(key, None)
+                count += 1
+        return count
+
+    def active_counts(self) -> dict:
+        """Return basic counters of active dialogs for GUI display."""
+        return {"uac": len(self.dialogs_uac), "uas": len(self.dialogs_uas)}
 
     def place_call(
         self,
@@ -893,6 +975,26 @@ class SIPManager:
                     s.send(ack)
                     call_established = True
                     talk_start = time.monotonic()
+                    # store dialog for future BYE-all operations
+                    remote_tag = ""
+                    if "tag=" in to_header:
+                        remote_tag = to_header.split("tag=", 1)[1].split(";", 1)[0]
+                    self.dialogs_uac[call_id] = Dialog(
+                        local_tag=tag,
+                        remote_tag=remote_tag,
+                        call_id=call_id,
+                        route_set=route_set.copy(),
+                        remote_target=remote_target,
+                        sock=s,
+                        our_next_cseq=invite_cseq + 1,
+                        to_header=to_header,
+                        from_uri=from_uri,
+                        from_display=from_display,
+                        contact_user=contact_user,
+                        local_ip=local_ip,
+                        local_port=local_port,
+                        role="uac",
+                    )
                     if wait_bye:
                         s.settimeout(0.5)
                         try:
@@ -994,6 +1096,7 @@ class SIPManager:
                     pass
             result = "aborted"
         finally:
+            self.dialogs_uac.pop(call_id, None)
             s.close()
             if 'rtp' in locals():
                 rtp.stop()
