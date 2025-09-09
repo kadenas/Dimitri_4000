@@ -61,6 +61,7 @@ def parse_args():
     p.add_argument("--advertised-ip", help="IP anunciada en Contact/SDP", default=None)
     p.add_argument("--cseq-start", type=int, default=1, help="CSeq inicial (por defecto 1)")
     p.add_argument("--service", action="store_true", help="Modo servicio continuo")
+    p.add_argument("--gui", action="store_true", help="Inicia interfaz gráfica Tkinter")
     p.add_argument("--tui", action="store_true", help="Inicia interfaz curses retro")
     p.add_argument("--uas", action="store_true", help="Habilita servidor SIP UAS")
     p.add_argument(
@@ -440,6 +441,12 @@ def run_load_generator(args, sip_manager, stats_cb=None):
 
 def main():
     args = parse_args()
+
+    if getattr(args, "gui", False):
+        from gui_tk import main as gui_main
+
+        gui_main(args)
+        return
 
     if getattr(args, "tui", False):
         from tui import run

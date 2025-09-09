@@ -33,6 +33,16 @@ dst_host: 127.0.0.1
 ```
 
 
+## GUI (Tkinter)
+
+La opción `--gui` abre una ventana sencilla para configurar y ejecutar pruebas sin usar la línea de comandos:
+
+```bash
+python app.py --gui
+```
+
+La interfaz se organiza en tres pestañas (General, Identidad/SIP y Carga) y un panel inferior de estado con contadores y un visor de logs. Desde los botones se pueden lanzar pruebas de OPTIONS, iniciar un UAS básico, realizar una llamada individual o arrancar el generador de carga. El log mostrado en pantalla puede guardarse a archivo mediante el botón "Guardar log...".
+
 ## Instalación en Ubuntu
 
 ```bash
