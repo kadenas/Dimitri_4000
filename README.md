@@ -4,6 +4,35 @@ Monitor sencillo para verificar servidores SIP mediante mensajes OPTIONS e
 INVITE. Incluye una interfaz de terminal basada en `curses` para realizar
 pruebas de latencia y observar el estado de la conexión.
 
+## TUI
+
+La opción `--tui` inicia una interfaz retro en la que se pueden editar
+parámetros y lanzar pruebas sin teclear comandos manualmente:
+
+```bash
+python app.py --tui
+```
+
+Atajos principales:
+
+* `F5` – enviar tres OPTIONS al destino configurado.
+* `F6` – arrancar un UAS básico en segundo plano.
+* `F7` – iniciar una llamada simple (UAC).
+* `F8` – ejecutar el generador de carga con los parámetros actuales.
+* `F9` – detener cualquier tarea en ejecución.
+* `ESC` – salir limpiamente.
+
+Ejemplo de pantalla:
+
+```
+Dimitri 4000 TUI - F5 OPTIONS F6 UAS F7 CALL F8 LOAD F9 STOP ESC quit
+role: UAC
+bind_ip:
+dst_host: 127.0.0.1
+...
+```
+
+
 ## Instalación en Ubuntu
 
 ```bash

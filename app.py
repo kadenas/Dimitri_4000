@@ -61,6 +61,7 @@ def parse_args():
     p.add_argument("--advertised-ip", help="IP anunciada en Contact/SDP", default=None)
     p.add_argument("--cseq-start", type=int, default=1, help="CSeq inicial (por defecto 1)")
     p.add_argument("--service", action="store_true", help="Modo servicio continuo")
+    p.add_argument("--tui", action="store_true", help="Inicia interfaz curses retro")
     p.add_argument("--uas", action="store_true", help="Habilita servidor SIP UAS")
     p.add_argument(
         "--uas-ring-delay",
@@ -236,8 +237,19 @@ def parse_args():
     return args
 
 
-def run_load_generator(args, sip_manager):
-    """Generate many calls with controlled rate and incremental parameters."""
+def run_load_generator(args, sip_manager, stats_cb=None):
+    """Generate many calls with controlled rate and incremental parameters.
+
+    Parameters
+    ----------
+    args: Namespace
+        Argumentos de configuración.
+    sip_manager: SIPManager
+        Gestor SIP para realizar las llamadas.
+    stats_cb: callable | None
+        Si se proporciona, se invoca periódicamente con una copia de los
+        contadores actuales.
+    """
     import threading
     from datetime import datetime, UTC
     import time
@@ -365,12 +377,19 @@ def run_load_generator(args, sip_manager):
     def printer():
         while not stop.is_set():
             with lock:
+                snapshot = counters.copy()
+                snapshot["active"] = len(active)
                 line = (
-                    f"[LOAD] active={len(active)} launched={counters['launched']} "
-                    f"established={counters['established']} 4xx={counters['failed_4xx']} "
-                    f"5xx={counters['failed_5xx_6xx']} canceled={counters['canceled']} "
-                    f"remote_bye={counters['remote_bye']}"
+                    f"[LOAD] active={snapshot['active']} launched={snapshot['launched']} "
+                    f"established={snapshot['established']} 4xx={snapshot['failed_4xx']} "
+                    f"5xx={snapshot['failed_5xx_6xx']} canceled={snapshot['canceled']} "
+                    f"remote_bye={snapshot['remote_bye']}"
                 )
+            if stats_cb:
+                try:
+                    stats_cb(snapshot)
+                except Exception:
+                    pass
             print(line)
             if stop.wait(2):
                 break
@@ -404,10 +423,24 @@ def run_load_generator(args, sip_manager):
         t.join()
     stop.set()
     printer_t.join()
+    if stats_cb:
+        with lock:
+            final = counters.copy()
+            final["active"] = len(active)
+        try:
+            stats_cb(final)
+        except Exception:
+            pass
     return counters
 
 def main():
     args = parse_args()
+
+    if getattr(args, "tui", False):
+        from tui import run
+
+        run(args)
+        return
 
     if args.load:
         if not (args.dst or args.host):
