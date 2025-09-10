@@ -8,6 +8,9 @@ import socket
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from types import SimpleNamespace
+import uuid
+
+from sdp import build_sdp, parse_sdp, PT_FROM_CODEC_NAME
 
 from sip_manager import (
     SIPManager,
@@ -743,9 +746,13 @@ class App(tk.Tk):
             cfg = self.get_config()
             if not cfg:
                 return
+            sock = self._ensure_shared_sock()
+            self.sm = SIPManager(sock=sock)
             self.stop_event.clear()
             self.uas_thread = threading.Thread(
-                target=uas_worker, args=(cfg, self.event_q, self.stop_event), daemon=True
+                target=uas_worker,
+                args=(cfg, self.event_q, self.stop_event, self.sm),
+                daemon=True,
             )
             self.uas_thread.start()
             self.uas_btn.config(text="Detener UAS")
@@ -1023,6 +1030,15 @@ def call_worker(cfg, event_q, sm):
     event_q.put(("uac", counters.copy()))
     dst = cfg.get("dst_host")
     dport = int(cfg.get("dst_port", 5060))
+    codec_names = [c.strip() for c in cfg.get("codecs", "pcmu,pcma").split(",") if c.strip()]
+    codecs = []
+    for name in codec_names:
+        pt = PT_FROM_CODEC_NAME.get(name.lower())
+        if pt is not None:
+            codecs.append((pt, name.upper()))
+    if not codecs:
+        codecs = [(0, "PCMU"), (8, "PCMA")]
+    tone = int(cfg.get("tone_hz", "0") or 0)
     try:
         _, result, _, _ = sm.place_call(
             dst_host=dst,
@@ -1032,9 +1048,12 @@ def call_worker(cfg, event_q, sm):
             from_display=cfg.get("from_display") or None,
             to_number=cfg.get("to_number") or "1001",
             to_domain=cfg.get("to_domain") or None,
-            codecs=[(0, "PCMU"), (8, "PCMA")],
+            codecs=codecs,
             rtp_port=int(cfg.get("rtp_port_base", "40000")),
             rtp_port_forced=True,
+            tone_hz=tone or None,
+            send_silence=cfg.get("send_silence", False),
+            symmetric=cfg.get("symmetric_rtp", False),
             stats_interval=float(cfg.get("rtp_stats_every", "2.0")),
             wait_bye=cfg.get("wait_bye", True),
         )
@@ -1098,11 +1117,111 @@ def load_worker(cfg, event_q, stop_event, sm):
     event_q.put(("log", "Load finished"))
 
 
-def uas_worker(cfg, event_q, stop_event):
+def uas_worker(cfg, event_q, stop_event, sm):
+    sock = sm.sock
+    if not sock:
+        event_q.put(("log", "UAS socket not available"))
+        return
+    sock.settimeout(0.5)
+    codec_names = [c.strip() for c in cfg.get("codecs", "pcmu,pcma").split(",") if c.strip()]
+    codecs = []
+    for name in codec_names:
+        pt = PT_FROM_CODEC_NAME.get(name.lower())
+        if pt is not None:
+            codecs.append((pt, name.upper()))
+    if not codecs:
+        codecs = [(0, "PCMU"), (8, "PCMA")]
+    local_ip = sock.getsockname()[0]
+    rtp_port = int(cfg.get("rtp_port_base", "40000"))
+    dialogs = {}
     event_q.put(("log", "UAS service started"))
     try:
         while not stop_event.is_set():
-            time.sleep(0.5)
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            start, headers = parse_headers(data)
+            if not start:
+                continue
+            if start.startswith("INVITE "):
+                try:
+                    via = headers["via"]
+                    fr = headers["from"]
+                    to = headers["to"]
+                    call_id = headers["call-id"]
+                    cseq_hdr = headers["cseq"]
+                except KeyError:
+                    continue
+                remote_tag = None
+                if "tag=" in fr.lower():
+                    remote_tag = fr.split("tag=")[1].split(";", 1)[0]
+                local_tag = uuid.uuid4().hex[:8]
+                to_resp = f"{to};tag={local_tag}"
+                headers_base = {
+                    "Via": via,
+                    "From": fr,
+                    "To": to_resp,
+                    "Call-ID": call_id,
+                    "CSeq": cseq_hdr,
+                }
+                sock.sendto(build_trying(headers_base), addr)
+                sock.sendto(build_ringing(headers_base), addr)
+                body = b""
+                if b"\r\n\r\n" in data:
+                    body = data.split(b"\r\n\r\n", 1)[1]
+                sdp_info = parse_sdp(body)
+                remote_pts = sdp_info.get("pts") or []
+                local_pts = [pt for pt, _ in codecs]
+                if remote_pts:
+                    common = [pt for pt in remote_pts if pt in local_pts]
+                    if not common:
+                        headers488 = headers_base.copy()
+                        sock.sendto(build_response(488, "Not Acceptable Here", headers488), addr)
+                        continue
+                    use_codecs = [(pt, name) for pt, name in codecs if pt == common[0]]
+                else:
+                    use_codecs = codecs
+                sdp_ans = build_sdp(local_ip, rtp_port, use_codecs)
+                headers200 = headers_base.copy()
+                headers200.update(
+                    {
+                        "Contact": f"<sip:dimitri@{local_ip}:{sock.getsockname()[1]}>",
+                        "Allow": "INVITE, ACK, CANCEL, OPTIONS, BYE",
+                        "Accept": "application/sdp",
+                        "Content-Type": "application/sdp",
+                    }
+                )
+                sock.sendto(build_200(headers200, sdp_ans), addr)
+                key = (call_id, remote_tag)
+                dialogs[key] = {"local_tag": local_tag, "to_uri": to.split(";", 1)[0]}
+                event_q.put(("uas", {"dialogs": len(dialogs)}))
+            elif start.startswith("BYE "):
+                try:
+                    via = headers["via"]
+                    fr = headers["from"]
+                    to = headers["to"]
+                    call_id = headers["call-id"]
+                    cseq_hdr = headers["cseq"]
+                except KeyError:
+                    continue
+                remote_tag = None
+                if "tag=" in fr.lower():
+                    remote_tag = fr.split("tag=")[1].split(";", 1)[0]
+                key = (call_id, remote_tag)
+                info = dialogs.pop(key, None)
+                to_resp = to
+                if info:
+                    to_resp = f"{info['to_uri']};tag={info['local_tag']}"
+                    event_q.put(("uas", {"dialogs": len(dialogs)}))
+                headers200 = {
+                    "Via": via,
+                    "From": fr,
+                    "To": to_resp,
+                    "Call-ID": call_id,
+                    "CSeq": cseq_hdr,
+                }
+                sock.sendto(build_200(headers200), addr)
     finally:
         event_q.put(("log", "UAS service stopped"))
 
