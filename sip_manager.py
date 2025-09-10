@@ -337,6 +337,26 @@ def build_response(
         lines.append("Content-Length: 0\r\n\r\n")
         return "".join(lines).encode()
 
+
+def build_trying(headers: dict) -> bytes:
+    """Shortcut to build a 100 Trying response."""
+    return build_response(100, "Trying", headers)
+
+
+def build_ringing(headers: dict) -> bytes:
+    """Shortcut to build a 180 Ringing response."""
+    return build_response(180, "Ringing", headers)
+
+
+def build_200(headers: dict, body: bytes | str = b"") -> bytes:
+    """Shortcut to build a 200 OK response."""
+    return build_response(200, "OK", headers, body)
+
+
+def build_487(headers: dict) -> bytes:
+    """Shortcut to build a 487 Request Terminated response."""
+    return build_response(487, "Request Terminated", headers)
+
 def build_bye(dialog: dict) -> bytes:
     """Build a BYE request from stored dialog information (UAS side)."""
     branch = "z9hG4bK" + uuid.uuid4().hex
