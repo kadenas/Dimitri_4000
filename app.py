@@ -7,6 +7,7 @@ import time
 import uuid
 import sys
 import errno
+import threading
 from datetime import datetime, UTC
 
 # logging básico por si no existe logging_conf en tu repo
@@ -40,6 +41,54 @@ def write_csv_row(path, row, header=None):
         if new_file and header:
             w.writerow(header)
         w.writerow(row)
+
+
+def send_options_periodic(
+    bind_ip: str | None,
+    src_port: int,
+    dst_host: str,
+    dst_port: int,
+    interval: float,
+    timeout: float,
+    cseq_start: int = 1,
+    stop_event: threading.Event | None = None,
+    cb=None,
+):
+    """Send SIP OPTIONS periodically until stop_event is set."""
+    sm = SIPManager(protocol="udp")
+    cseq = cseq_start
+    counters = {"sent": 0, "ok": 0, "other": 0, "timeout": 0, "last": "-"}
+    stop_event = stop_event or threading.Event()
+    while not stop_event.is_set():
+        counters["sent"] += 1
+        try:
+            code, _, _ = sm.send_request(
+                dst_host=dst_host,
+                dst_port=dst_port,
+                timeout=timeout,
+                bind_ip=bind_ip,
+                bind_port=src_port,
+                cseq=cseq,
+            )
+        except OSError:
+            counters["other"] += 1
+            counters["last"] = "error"
+        else:
+            if code is None:
+                counters["timeout"] += 1
+                counters["last"] = "timeout"
+            elif code == 200:
+                counters["ok"] += 1
+                counters["last"] = "200"
+            else:
+                counters["other"] += 1
+                counters["last"] = str(code)
+        if cb:
+            cb(counters.copy())
+        cseq += 1
+        if stop_event.wait(interval):
+            break
+    return counters
 
 
 def parse_args():

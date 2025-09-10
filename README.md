@@ -49,6 +49,29 @@ Botones principales:
 - **Generador**: lanza múltiples llamadas consecutivas según la configuración de la pestaña "Carga".
 - **BYE todas (UAC/UAS)**: envía BYE a todos los diálogos activos del rol correspondiente.
 
+### Monitorización por OPTIONS (GUI y CLI)
+
+En la pestaña **General** encontrarás el apartado *Monitorización OPTIONS* desde el que
+se pueden enviar OPTIONS periódicos al destino configurado.
+
+1. Ajusta `interval`, `timeout` y `cseq_start`.
+2. Marca **usar src_port para OPTIONS** si quieres fijar el puerto local.
+3. Activa **Responder OPTIONS** para contestar automáticamente 200 OK a
+   solicitudes entrantes en `src_port`.
+4. Pulsa **Iniciar monitor** para comenzar el latido.
+
+La GUI muestra contadores en vivo (`sent`, `200`, `other`, `timeout`) y el
+resultado del último envío con un indicador de color. El botón **Copiar comando CLI**
+genera y copia al portapapeles un comando equivalente, por ejemplo:
+
+```
+python app.py --service --reply-options --bind-ip 0.0.0.0 --src-port 5060 \
+    --dst 1.2.3.4 --dst-port 5060 --interval 1.0 --cseq-start 1
+```
+
+Nota: para pruebas en la misma máquina inicia dos instancias con puertos
+distintos (por ejemplo 5060 y 5062) y activa el monitor en ambas.
+
 ## Instalación en Ubuntu
 
 ```bash

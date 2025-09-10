@@ -9,7 +9,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from types import SimpleNamespace
 
-from sip_manager import SIPManager
+from sip_manager import SIPManager, build_response, parse_headers
 from app import run_load_generator
 
 # Configuration persisted in user home directory
@@ -19,6 +19,10 @@ DEFAULT_CONFIG = {
     "bind_ip": "",
     "src_port": "0",
     "use_src_port_options": True,
+    "interval": "1.0",
+    "timeout": "2.0",
+    "cseq_start": "1",
+    "reply_options": False,
     "dst_host": "127.0.0.1",
     "dst_port": "5060",
     "codecs": "pcmu,pcma",
@@ -88,7 +92,7 @@ class App(tk.Tk):
         self.event_q: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
         self.state = {
-            "options": {"sent": 0, "ok": 0, "other": 0, "timeout": 0},
+            "options": {"sent": 0, "ok": 0, "other": 0, "timeout": 0, "last": "-", "rx": 0},
             "uac": {
                 "launched": 0,
                 "active": 0,
@@ -134,13 +138,6 @@ class App(tk.Tk):
         lf_origen.grid(row=0, column=0, sticky="nsew", padx=8, pady=4)
         self._add_entry(lf_origen, "bind_ip", 0, cfg)
         self._add_entry(lf_origen, "src_port", 1, cfg)
-        self._add_check(
-            lf_origen,
-            "use_src_port_options",
-            2,
-            cfg,
-            text="usar src_port para OPTIONS",
-        )
 
         lf_dest = ttk.LabelFrame(general, text="Destino")
         lf_dest.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
@@ -169,6 +166,56 @@ class App(tk.Tk):
             cfg,
             text="exigir health para llamadas",
         )
+
+        lf_opts = ttk.LabelFrame(general, text="Monitorización OPTIONS")
+        lf_opts.grid(row=4, column=0, sticky="nsew", padx=8, pady=4)
+        self._add_entry(lf_opts, "interval", 0, cfg)
+        self._add_entry(lf_opts, "timeout", 1, cfg)
+        self._add_entry(lf_opts, "cseq_start", 2, cfg)
+        self._add_check(
+            lf_opts,
+            "use_src_port_options",
+            3,
+            cfg,
+            text="usar src_port para OPTIONS",
+        )
+        self._add_check(lf_opts, "reply_options", 4, cfg, text="Responder OPTIONS")
+
+        opt_btns = ttk.Frame(lf_opts)
+        opt_btns.grid(row=5, column=0, columnspan=2, pady=4)
+        self.mon_start_btn = ttk.Button(
+            opt_btns, text="Iniciar monitor", command=self.start_options_monitor
+        )
+        self.mon_stop_btn = ttk.Button(
+            opt_btns, text="Parar monitor", command=self.stop_options_monitor
+        )
+        self.mon_reset_btn = ttk.Button(
+            opt_btns, text="Reset", command=self.reset_options_monitor
+        )
+        self.mon_copy_btn = ttk.Button(
+            opt_btns, text="Copiar comando CLI", command=self.copy_cli_command
+        )
+        for i, b in enumerate(
+            [self.mon_start_btn, self.mon_stop_btn, self.mon_reset_btn, self.mon_copy_btn]
+        ):
+            b.grid(row=0, column=i, padx=2)
+
+        self.monitor_status_lbl = ttk.Label(
+            lf_opts, text="monitor: PARADO", style="Status.Warn.TLabel"
+        )
+        self.monitor_status_lbl.grid(
+            row=6, column=0, columnspan=2, sticky="w", padx=8, pady=2
+        )
+        self.monitor_counts_lbl = ttk.Label(
+            lf_opts,
+            text="sent=0 200=0 other=0 timeout=0 last=-",
+            style="Status.Warn.TLabel",
+        )
+        self.monitor_counts_lbl.grid(
+            row=7, column=0, columnspan=2, sticky="w", padx=8, pady=2
+        )
+        self.monitor_rx_lbl = ttk.Label(lf_opts, text="rx_options=0")
+        self.monitor_rx_lbl.grid(row=8, column=0, columnspan=2, sticky="w", padx=8)
 
         # ------------------ Identity tab ------------------
         identity = ttk.Frame(nb)
@@ -278,9 +325,15 @@ class App(tk.Tk):
             if kind == "log":
                 self.log_text.insert("end", data + "\n")
                 self.log_text.see("end")
-            elif kind == "options":
+            elif kind in {"options", "options_metrics"}:
                 self.state["options"].update(data)
-                self.health_ok = data.get("ok", 0) > 0 and data.get("other", 0) == 0 and data.get("timeout", 0) == 0
+                self.health_ok = (
+                    self.state["options"].get("ok", 0) > 0
+                    and self.state["options"].get("other", 0) == 0
+                    and self.state["options"].get("timeout", 0) == 0
+                )
+            elif kind == "options_rx":
+                self.state["options"]["rx"] = data
             elif kind == "uac":
                 self.state["uac"].update(data)
             elif kind == "uas":
@@ -290,6 +343,29 @@ class App(tk.Tk):
         self.after(200, self._process_events)
 
     def _refresh_status(self):
+        opt = self.state["options"]
+        if getattr(self, "options_thread", None) and self.options_thread.is_alive():
+            self.monitor_status_lbl.config(
+                text="monitor: ACTIVO", style="Status.OK.TLabel"
+            )
+        else:
+            self.monitor_status_lbl.config(
+                text="monitor: PARADO", style="Status.Warn.TLabel"
+            )
+        style_last = "Status.OK.TLabel"
+        if opt.get("last") in {"timeout", "error"}:
+            style_last = "Status.Bad.TLabel"
+        elif opt.get("last") not in {"200", "-"}:
+            style_last = "Status.Warn.TLabel"
+        self.monitor_counts_lbl.config(
+            text=(
+                f"sent={opt['sent']} 200={opt['ok']} other={opt['other']} "
+                f"timeout={opt['timeout']} last={opt.get('last', '-')}"
+            ),
+            style=style_last,
+        )
+        self.monitor_rx_lbl.config(text=f"rx_options={opt.get('rx', 0)}")
+
         style = "Status.OK.TLabel" if self.health_ok else "Status.Bad.TLabel"
         self.health_lbl.config(
             text=f"health: {'OK' if self.health_ok else 'FAIL'}",
@@ -328,7 +404,21 @@ class App(tk.Tk):
                 resolvable = False
         dest_ok = resolvable and dport.isdigit()
 
+        interval_s = self.vars.get("interval", tk.StringVar()).get().strip()
+        try:
+            interval_ok = float(interval_s) > 0
+        except ValueError:
+            interval_ok = False
+
         self.opt_btn.state(["!disabled" if resolvable else "disabled"])
+
+        if getattr(self, "options_thread", None) and self.options_thread.is_alive():
+            self.mon_start_btn.state(["disabled"])
+            self.mon_stop_btn.state(["!disabled"])
+        else:
+            enable_mon = dest_ok and interval_ok
+            self.mon_start_btn.state(["!disabled" if enable_mon else "disabled"])
+            self.mon_stop_btn.state(["disabled"])
 
         base_enabled = self.health_ok or self.vars.get("ignore_health", tk.BooleanVar()).get()
         if not dest_ok:
@@ -395,19 +485,21 @@ class App(tk.Tk):
                 "src_port_base",
                 "src_port_step",
                 "rtp_port_step",
+                "interval",
+                "timeout",
+                "cseq_start",
             ]:
                 if key in cfg and cfg[key] != "":
-                    if key in {"rate", "rtp_stats_every"}:
-                        float(cfg[key])
+                    if key in {"rate", "rtp_stats_every", "interval", "timeout"}:
+                        cfg[key] = float(cfg[key])
                     else:
-                        val = int(cfg[key])
-                        cfg[key] = str(val)
+                        cfg[key] = int(cfg[key])
             if cfg.get("rtp_port_base"):
                 rtp = int(cfg["rtp_port_base"])
                 if rtp % 2:
                     rtp += 1
-                    cfg["rtp_port_base"] = str(rtp)
-                    self.vars["rtp_port_base"].set(cfg["rtp_port_base"])
+                    cfg["rtp_port_base"] = rtp
+                    self.vars["rtp_port_base"].set(str(rtp))
                     logging.info(
                         "rtp_port_base debe ser par; ajustado a %s", rtp
                     )
@@ -415,6 +507,100 @@ class App(tk.Tk):
             messagebox.showerror("Valor inválido", str(exc))
             return None
         return cfg
+
+    def start_options_monitor(self):
+        if getattr(self, "options_thread", None) and self.options_thread.is_alive():
+            return
+        cfg = self.get_config()
+        if not cfg:
+            return
+        interval = cfg.get("interval", 1.0)
+        if interval <= 0:
+            return
+        bind_ip = cfg.get("bind_ip") or None
+        dst_host = cfg.get("dst_host")
+        dst_port = int(cfg.get("dst_port", 5060))
+        src_port = int(cfg.get("src_port", 0))
+        if not cfg.get("use_src_port_options", True) or (
+            reply_opt and src_port
+        ):
+            send_port = 0
+        else:
+            send_port = src_port
+        timeout = cfg.get("timeout", 2.0)
+        cseq_start = int(cfg.get("cseq_start", 1))
+        reply_opt = cfg.get("reply_options", False)
+        self.options_thread = OptionsMonitorWorker(
+            bind_ip,
+            send_port,
+            dst_host,
+            dst_port,
+            interval,
+            timeout,
+            cseq_start,
+            reply_opt,
+            self.event_q,
+        )
+        self.options_thread.start()
+        if reply_opt:
+            self.options_responder = OptionsResponder(bind_ip, src_port, self.event_q)
+            self.options_responder.start()
+        self.monitor_status_lbl.config(text="monitor: ACTIVO", style="Status.OK.TLabel")
+        self.update_button_states()
+
+    def stop_options_monitor(self):
+        if getattr(self, "options_thread", None):
+            self.options_thread.stop()
+            self.options_thread.join(timeout=1)
+            self.options_thread = None
+        if getattr(self, "options_responder", None):
+            self.options_responder.stop()
+            self.options_responder.join(timeout=1)
+            self.options_responder = None
+        self.monitor_status_lbl.config(text="monitor: PARADO", style="Status.Warn.TLabel")
+        self.update_button_states()
+
+    def reset_options_monitor(self):
+        self.state["options"] = {"sent": 0, "ok": 0, "other": 0, "timeout": 0, "last": "-", "rx": 0}
+        self.event_q.put(("options_metrics", self.state["options"].copy()))
+
+    def copy_cli_command(self):
+        cfg = self.get_config()
+        if not cfg:
+            return
+        bind_ip = cfg.get("bind_ip")
+        src_port = int(cfg.get("src_port", 0))
+        if not cfg.get("use_src_port_options", True):
+            src_port = 0
+        parts = [
+            "python",
+            "app.py",
+            "--service",
+        ]
+        if cfg.get("reply_options", False):
+            parts.append("--reply-options")
+        if bind_ip:
+            parts.extend(["--bind-ip", str(bind_ip)])
+        parts.extend([
+            "--src-port",
+            str(src_port),
+            "--dst",
+            cfg.get("dst_host", ""),
+            "--dst-port",
+            str(int(cfg.get("dst_port", 5060))),
+            "--interval",
+            str(cfg.get("interval", 1.0)),
+            "--timeout",
+            str(cfg.get("timeout", 2.0)),
+            "--cseq-start",
+            str(int(cfg.get("cseq_start", 1))),
+        ])
+        cmd = " ".join(parts)
+        self.clipboard_clear()
+        self.clipboard_append(cmd)
+        print(cmd)
+        self.event_q.put(("log", cmd))
+        self.event_q.put(("log", "Comando copiado al portapapeles"))
 
     def start_options(self):
         cfg = self.get_config()
@@ -461,6 +647,7 @@ class App(tk.Tk):
 
     def stop_all(self):
         self.stop_event.set()
+        self.stop_options_monitor()
         if getattr(self, "load_thread", None):
             self.load_thread.join(timeout=1)
             self.load_thread = None
@@ -497,6 +684,139 @@ class App(tk.Tk):
                 save_config(cfg)
             self.destroy()
 
+
+class OptionsResponder(threading.Thread):
+    def __init__(self, bind_ip, src_port, event_q):
+        super().__init__(daemon=True)
+        self.bind_ip = bind_ip or "0.0.0.0"
+        self.src_port = src_port
+        self.event_q = event_q
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                pass
+        sock.bind((self.bind_ip, self.src_port))
+        sock.settimeout(0.5)
+        count = 0
+        while not self._stop.is_set():
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            start, headers = parse_headers(data)
+            if not start.startswith("OPTIONS "):
+                continue
+            via = headers.get("via")
+            fr = headers.get("from")
+            to = headers.get("to")
+            call_id = headers.get("call-id")
+            cseq_hdr = headers.get("cseq")
+            if not all([via, fr, to, call_id, cseq_hdr]):
+                continue
+            if "tag=" not in to.lower():
+                to = f"{to};tag=resp"
+            headers_resp = {
+                "Via": via,
+                "From": fr,
+                "To": to,
+                "Call-ID": call_id,
+                "CSeq": cseq_hdr,
+                "Contact": f"<sip:dimitri@{sock.getsockname()[0]}:{sock.getsockname()[1]}>",
+                "User-Agent": "Dimitri-4000/0.1",
+                "Allow": "INVITE, ACK, CANCEL, OPTIONS, BYE",
+                "Accept": "application/sdp",
+            }
+            sock.sendto(build_response(200, "OK", headers_resp), addr)
+            count += 1
+            self.event_q.put(
+                (
+                    "log",
+                    f"Responded 200 OK to OPTIONS from {addr[0]}:{addr[1]}",
+                )
+            )
+            self.event_q.put(("options_rx", count))
+        sock.close()
+
+
+class OptionsMonitorWorker(threading.Thread):
+    def __init__(
+        self,
+        bind_ip,
+        src_port,
+        dst_host,
+        dst_port,
+        interval,
+        timeout,
+        cseq_start,
+        reply_options_enabled,
+        event_q,
+    ):
+        super().__init__(daemon=True)
+        self.bind_ip = bind_ip
+        self.src_port = src_port
+        self.dst_host = dst_host
+        self.dst_port = dst_port
+        self.interval = interval
+        self.timeout = timeout
+        self.cseq = cseq_start
+        self.reply_options_enabled = reply_options_enabled
+        self.event_q = event_q
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        sm = SIPManager(protocol="udp")
+        self.event_q.put(
+            (
+                "log",
+                f"OPTIONS monitor started dst={self.dst_host}:{self.dst_port} every {self.interval}s from {self.bind_ip or '0.0.0.0'}:{self.src_port or 'ephemeral'}",
+            )
+        )
+        counters = {"sent": 0, "ok": 0, "other": 0, "timeout": 0, "last": "-"}
+        while not self._stop.is_set():
+            counters["sent"] += 1
+            try:
+                code, _, _ = sm.send_request(
+                    dst_host=self.dst_host,
+                    dst_port=self.dst_port,
+                    timeout=self.timeout,
+                    bind_ip=self.bind_ip,
+                    bind_port=self.src_port,
+                    cseq=self.cseq,
+                )
+            except OSError as exc:
+                counters["other"] += 1
+                counters["last"] = "error"
+                self.event_q.put(("log", f"OPTIONS error: {exc}"))
+            else:
+                if code is None:
+                    counters["timeout"] += 1
+                    counters["last"] = "timeout"
+                    self.event_q.put(("log", "OPTIONS timeout"))
+                elif code == 200:
+                    counters["ok"] += 1
+                    counters["last"] = "200"
+                    self.event_q.put(("log", "OPTIONS 200"))
+                else:
+                    counters["other"] += 1
+                    counters["last"] = str(code)
+                    self.event_q.put(("log", f"OPTIONS {code}"))
+            self.event_q.put(("options_metrics", counters.copy()))
+            self.cseq += 1
+            if self._stop.wait(self.interval):
+                break
+        self.event_q.put(("log", "OPTIONS monitor stopped"))
 
 def options_worker(cfg, event_q):
     counters = {"sent": 0, "ok": 0, "other": 0, "timeout": 0}
