@@ -5,6 +5,7 @@ import threading
 import queue
 import time
 import socket
+import errno
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from types import SimpleNamespace
@@ -92,7 +93,14 @@ class App(tk.Tk):
         self.event_q: queue.Queue = queue.Queue()
         self.stop_event = threading.Event()
         self.state = {
-            "options": {"sent": 0, "ok": 0, "other": 0, "timeout": 0, "last": "-", "rx": 0},
+            "options": {
+                "sent": 0,
+                "ok200": 0,
+                "other": 0,
+                "timeouts": 0,
+                "last": "-",
+                "rx": 0,
+            },
             "uac": {
                 "launched": 0,
                 "active": 0,
@@ -338,9 +346,14 @@ class App(tk.Tk):
             except queue.Empty:
                 break
             if kind == "log":
-                self.log_text.insert("end", data + "\n")
+                line = data.get("line") if isinstance(data, dict) else data
+                self.log_text.insert("end", line + "\n")
                 self.log_text.see("end")
             elif kind in {"options", "options_metrics"}:
+                if "ok" in data and "ok200" not in data:
+                    data["ok200"] = data.pop("ok")
+                if "timeout" in data and "timeouts" not in data:
+                    data["timeouts"] = data.pop("timeout")
                 self.state["options"].update(data)
                 now = time.monotonic()
                 if data.get("last") == "200":
@@ -386,10 +399,12 @@ class App(tk.Tk):
             style_last = "Status.Bad.TLabel"
         elif opt.get("last") not in {"200", "-"}:
             style_last = "Status.Warn.TLabel"
+        ok = opt.get("ok200", opt.get("ok", 0))
+        tout = opt.get("timeouts", opt.get("timeout", 0))
         self.monitor_counts_lbl.config(
             text=(
-                f"sent={opt['sent']} 200={opt['ok']} other={opt['other']} "
-                f"timeout={opt['timeout']} last={opt.get('last', '-')}"
+                f"sent={opt.get('sent', 0)} 200={ok} other={opt.get('other', 0)} "
+                f"timeout={tout} last={opt.get('last', '-')}"
             ),
             style=style_last,
         )
@@ -586,6 +601,11 @@ class App(tk.Tk):
             """Publish events coming from monitor thread to GUI queue."""
             self.event_q.put((payload.pop("type"), payload))
 
+        if reply_opt:
+            self.options_responder = OptionsResponder(
+                bind_ip, reply_on_port, self.event_q
+            )
+            self.options_responder.start()
         self.options_thread = OptionsMonitorThread(
             bind_ip=bind_ip,
             src_port=send_from_port,
@@ -599,9 +619,6 @@ class App(tk.Tk):
             publish_event=pub,
         )
         self.options_thread.start()
-        if reply_opt:
-            self.options_responder = OptionsResponder(bind_ip, reply_on_port, self.event_q)
-            self.options_responder.start()
         self.monitor_status_lbl.config(text="monitor: ACTIVO", style="Status.OK.TLabel")
         logging.info(
             f"OPTIONS monitor started dst={dst_host}:{dst_port} every {interval}s "
@@ -623,7 +640,14 @@ class App(tk.Tk):
         self.update_button_states()
 
     def reset_options_monitor(self):
-        self.state["options"] = {"sent": 0, "ok": 0, "other": 0, "timeout": 0, "last": "-", "rx": 0}
+        self.state["options"] = {
+            "sent": 0,
+            "ok200": 0,
+            "other": 0,
+            "timeouts": 0,
+            "last": "-",
+            "rx": 0,
+        }
         self.event_q.put(("options_metrics", self.state["options"].copy()))
         self.fail_streak = 0
 
@@ -823,8 +847,6 @@ class OptionsResponder(threading.Thread):
 
 
 class OptionsMonitorThread(threading.Thread):
-    """Monitor thread sending SIP OPTIONS using a persistent UDP socket."""
-
     def __init__(
         self,
         *,
@@ -835,8 +857,8 @@ class OptionsMonitorThread(threading.Thread):
         interval,
         timeout,
         cseq_start,
-        use_src_for_send,
-        reply_options,
+        use_src_for_send: bool,
+        reply_options: bool,
         publish_event,
     ):
         super().__init__(daemon=True)
@@ -851,17 +873,14 @@ class OptionsMonitorThread(threading.Thread):
         self.publish_event = publish_event
         self.stop_evt = threading.Event()
         self.sock = None
-        self.sent = 0
-        self.ok200 = 0
-        self.other = 0
-        self.timeouts = 0
+        # contadores
+        self.sent = self.ok200 = self.other = self.timeouts = 0
         self.last = None
+        self.owns_socket = True  # cerramos solo si lo creamos nosotros
 
     def _build_options(self, local_ip, local_port, cseq):
         call_id = f"mon{int(time.time()*1000)}@{local_ip}"
-        via = (
-            f"Via: SIP/2.0/UDP {local_ip}:{local_port};branch=z9hG4bK{cseq};rport\r\n"
-        )
+        via = f"Via: SIP/2.0/UDP {local_ip}:{local_port};branch=z9hG4bK{cseq};rport\r\n"
         msg = (
             f"OPTIONS sip:{self.dst[0]} SIP/2.0\r\n"
             + via
@@ -872,17 +891,33 @@ class OptionsMonitorThread(threading.Thread):
             + f"CSeq: {cseq} OPTIONS\r\n"
             + f"Contact: <sip:mon@{local_ip}>\r\n"
             + "User-Agent: Dimitri-4000/0.1\r\n"
-            + "Content-Length: 0\r\n"
-            + "\r\n"
+            + "Content-Length: 0\r\n\r\n"
         )
         return msg.encode("ascii", "ignore")
 
     def run(self):
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            if self.use_src and self.src_port > 0:
-                self.sock.bind((self.bind_ip, self.src_port))
             self.sock.settimeout(self.timeout)
+            # Intentar bind solo si se pidió usar src_port
+            if self.use_src and self.src_port > 0:
+                try:
+                    self.sock.bind((self.bind_ip, self.src_port))
+                except OSError as e:
+                    if e.errno == errno.EADDRINUSE:
+                        self.owns_socket = True
+                        if self.publish_event:
+                            self.publish_event(
+                                {
+                                    "type": "log",
+                                    "line": (
+                                        f"OPTIONS monitor: {self.bind_ip}:{self.src_port} ocupado; "
+                                        f"usando puerto efímero para el envío"
+                                    ),
+                                }
+                            )
+                    else:
+                        raise
 
             while not self.stop_evt.is_set():
                 local_ip, local_port = self.sock.getsockname()
@@ -890,7 +925,7 @@ class OptionsMonitorThread(threading.Thread):
                 try:
                     self.sock.sendto(payload, self.dst)
                     self.sent += 1
-                    data, _ = self.sock.recvfrom(4096)
+                    data, addr = self.sock.recvfrom(4096)
                     if data.startswith(b"SIP/2.0 200"):
                         self.ok200 += 1
                         self.last = "200"
@@ -906,9 +941,9 @@ class OptionsMonitorThread(threading.Thread):
                         {
                             "type": "options_metrics",
                             "sent": self.sent,
-                            "ok": self.ok200,
+                            "ok200": self.ok200,
                             "other": self.other,
-                            "timeout": self.timeouts,
+                            "timeouts": self.timeouts,
                             "last": self.last,
                         }
                     )
@@ -917,10 +952,10 @@ class OptionsMonitorThread(threading.Thread):
                     break
 
         finally:
-            if self.sock:
+            if self.sock and self.owns_socket:
                 try:
                     self.sock.close()
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
             if self.publish_event:
                 self.publish_event({"type": "options_stopped"})
