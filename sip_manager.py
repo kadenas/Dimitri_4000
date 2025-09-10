@@ -5,6 +5,7 @@ import time
 import uuid
 import hashlib
 import secrets
+import errno
 from dataclasses import dataclass
 from typing import Dict, Tuple
 from rtp import RtpSession
@@ -397,8 +398,15 @@ def parse_headers(data: bytes):
 
 
 class SIPManager:
-    def __init__(self, protocol: str = "udp"):
+    def __init__(
+        self,
+        protocol: str = "udp",
+        sock: socket.socket | None = None,
+        logger: logging.Logger | None = None,
+    ):
         self.protocol = protocol
+        self.sock = sock
+        self.logger = logger or logging.getLogger("socket_handler")
         # dialogs indexed by Call-ID for UAC and UAS roles
         self.dialogs_uac: Dict[str, Dialog] = {}
         self.dialogs_uas: Dict[str, Dialog] = {}
@@ -508,10 +516,27 @@ class SIPManager:
         if self.protocol != "udp":
             raise NotImplementedError("Solo UDP por ahora.")
 
-        s, local_ip, local_port = self._open_connected_udp(
-            dst_host, dst_port, bind_ip, bind_port
-        )
-        s.settimeout(0.5)
+        owned_socket = False
+        prev_timeout = None
+        if self.sock:
+            s = self.sock
+            prev_timeout = s.gettimeout()
+            try:
+                s.connect((dst_host, dst_port))
+            except OSError as e:
+                if getattr(e, "errno", None) == errno.ECONNREFUSED:
+                    logger.error(
+                        f"Destino no escucha en {dst_host}:{dst_port}"
+                    )
+                raise
+            local_ip, local_port = s.getsockname()
+            s.settimeout(0.5)
+        else:
+            s, local_ip, local_port = self._open_connected_udp(
+                dst_host, dst_port, bind_ip, bind_port
+            )
+            s.settimeout(0.5)
+            owned_socket = True
 
         if from_uri:
             if not from_uri.startswith("sip:"):
@@ -569,7 +594,14 @@ class SIPManager:
         logger.info(
             f"Enviando INVITE (CSeq={invite_cseq}) a {dst_host}:{dst_port} sent-by={local_ip}:{local_port}"
         )
-        s.send(invite)
+        try:
+            s.send(invite)
+        except OSError as e:
+            if getattr(e, "errno", None) == errno.ECONNREFUSED:
+                logger.error(
+                    f"Destino no escucha en {dst_host}:{dst_port}"
+                )
+            raise
         t_start = time.monotonic()
         t1 = 0.5
         next_resend = t_start + t1
@@ -633,6 +665,13 @@ class SIPManager:
                     data2 = s.recv(4096)
                 except socket.timeout:
                     return cseq
+                except OSError as e:
+                    if getattr(e, "errno", None) == errno.ECONNREFUSED:
+                        logger.error(
+                            f"Destino no escucha en {dst_host}:{dst_port}"
+                        )
+                        return cseq
+                    raise
                 start2, headers2 = parse_headers(data2)
                 c2, _ = status_from_response(data2)
                 if c2 in (401, 407) and auth_user and auth_pass and not auth_state.get("bye_auth_done"):
@@ -734,10 +773,25 @@ class SIPManager:
                 except socket.timeout:
                     now = time.monotonic()
                     if not canceled and now >= next_resend:
-                        s.send(invite)
+                        try:
+                            s.send(invite)
+                        except OSError as e:
+                            if getattr(e, "errno", None) == errno.ECONNREFUSED:
+                                logger.error(
+                                    f"Destino no escucha en {dst_host}:{dst_port}"
+                                )
+                                raise
+                            raise
                         t1 = min(t1 * 2, 4.0)
                         next_resend = now + t1
                     continue
+                except OSError as e:
+                    if getattr(e, "errno", None) == errno.ECONNREFUSED:
+                        logger.error(
+                            f"Destino no escucha en {dst_host}:{dst_port}"
+                        )
+                        raise
+                    raise
 
                 code, reason = status_from_response(data)
                 start, headers = parse_headers(data)
@@ -830,7 +884,15 @@ class SIPManager:
                             auth_header=(hdr_name, auth_val),
                         )
                         logger.info("Reenviando INVITE con autenticacion Digest")
-                        s.send(invite)
+                        try:
+                            s.send(invite)
+                        except OSError as e:
+                            if getattr(e, "errno", None) == errno.ECONNREFUSED:
+                                logger.error(
+                                    f"Destino no escucha en {dst_host}:{dst_port}"
+                                )
+                                raise
+                            raise
                         t_start = time.monotonic()
                         t1 = 0.5
                         next_resend = t_start + t1
@@ -952,6 +1014,13 @@ class SIPManager:
                                     data2 = s.recv(4096)
                                 except socket.timeout:
                                     continue
+                                except OSError as e:
+                                    if getattr(e, "errno", None) == errno.ECONNREFUSED:
+                                        logger.error(
+                                            f"Destino no escucha en {dst_host}:{dst_port}"
+                                        )
+                                        raise
+                                    raise
                                 start2, headers2 = parse_headers(data2)
                                 if start2.startswith("BYE") and headers2.get(
                                     "call-id"
@@ -1039,7 +1108,15 @@ class SIPManager:
             result = "aborted"
         finally:
             self.dialogs_uac.pop(call_id, None)
-            s.close()
+            if owned_socket:
+                s.close()
+            else:
+                try:
+                    if prev_timeout is not None:
+                        s.settimeout(prev_timeout)
+                    s.connect(("0.0.0.0", 0))
+                except OSError:
+                    pass
             if 'rtp' in locals():
                 rtp.stop()
 

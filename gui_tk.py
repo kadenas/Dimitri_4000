@@ -701,6 +701,8 @@ class App(tk.Tk):
         cfg = self.get_config()
         if not cfg:
             return
+        sock = self._ensure_shared_sock()
+        self.sm = SIPManager(sock=sock)
         t = threading.Thread(target=call_worker, args=(cfg, self.event_q, self.sm))
         t.daemon = True
         t.start()
@@ -714,6 +716,8 @@ class App(tk.Tk):
         cfg = self.get_config()
         if not cfg:
             return
+        sock = self._ensure_shared_sock()
+        self.sm = SIPManager(sock=sock)
         t = threading.Thread(target=load_worker, args=(cfg, self.event_q, self.stop_event, self.sm))
         t.daemon = True
         t.start()
