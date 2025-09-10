@@ -104,7 +104,11 @@ class App(tk.Tk):
             },
             "uas": {"dialogs": 0},
         }
-        self.health_ok = False
+        self.health_state = "FAIL"     # "OK" | "FAIL"
+        self.last_200_ts = 0.0
+        self.health_grace_s = 5.0      # ventana de gracia desde el último 200
+        self.fail_streak = 0
+        self.fail_threshold = 3        # nº de fallos seguidos para marcar FAIL si no hay 200 reciente
         cfg = DEFAULT_CONFIG.copy()
         cfg.update(load_config())
         self.vars: dict[str, tk.Variable] = {}
@@ -119,13 +123,16 @@ class App(tk.Tk):
         self.after(200, self._process_events)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    # ------------------------------------------------------------------
-    def _build_ui(self, cfg):
+    def setup_styles(self):
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure("Status.OK.TLabel", background="#b6f7a5")
-        style.configure("Status.Bad.TLabel", background="#f7b6b6")
+        style.configure("Status.OK.TLabel", background="#c6f6d5")
+        style.configure("Status.Bad.TLabel", background="#fed7d7")
         style.configure("Status.Warn.TLabel", background="#f7e7a5")
+
+    # ------------------------------------------------------------------
+    def _build_ui(self, cfg):
+        self.setup_styles()
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True)
@@ -315,6 +322,14 @@ class App(tk.Tk):
         chk.grid(row=row, column=0, columnspan=2, sticky="w", padx=8, pady=4)
         self.vars[key] = var
 
+    def log(self, msg: str):
+        self.event_q.put(("log", msg))
+
+    def set_health(self, state: str):
+        style = "Status.OK.TLabel" if state == "OK" else "Status.Bad.TLabel"
+        self.health_state = state
+        self.health_lbl.config(text=f"health: {state}", style=style)
+
     # ------------------------------------------------------------------
     def _process_events(self):
         while True:
@@ -327,11 +342,25 @@ class App(tk.Tk):
                 self.log_text.see("end")
             elif kind in {"options", "options_metrics"}:
                 self.state["options"].update(data)
-                self.health_ok = (
-                    self.state["options"].get("ok", 0) > 0
-                    and self.state["options"].get("other", 0) == 0
-                    and self.state["options"].get("timeout", 0) == 0
-                )
+                now = time.monotonic()
+                if data.get("last") == "200":
+                    self.last_200_ts = now
+                    self.fail_streak = 0
+                    if self.health_state != "OK":
+                        self.set_health("OK")
+                        src = "monitor" if kind == "options_metrics" else "manual"
+                        self.log(f"health: OK ({src})")
+                else:
+                    if data.get("last") and data.get("last") != "-":
+                        self.fail_streak += 1
+                    if (
+                        (now - self.last_200_ts) > self.health_grace_s
+                        or self.fail_streak >= self.fail_threshold
+                    ):
+                        if self.health_state != "FAIL":
+                            self.set_health("FAIL")
+                            src = "monitor" if kind == "options_metrics" else "manual"
+                            self.log(f"health: FAIL ({src})")
             elif kind == "options_rx":
                 self.state["options"]["rx"] = data
             elif kind == "uac":
@@ -366,11 +395,10 @@ class App(tk.Tk):
         )
         self.monitor_rx_lbl.config(text=f"rx_options={opt.get('rx', 0)}")
 
-        style = "Status.OK.TLabel" if self.health_ok else "Status.Bad.TLabel"
-        self.health_lbl.config(
-            text=f"health: {'OK' if self.health_ok else 'FAIL'}",
-            style=style,
+        style = (
+            "Status.OK.TLabel" if self.health_state == "OK" else "Status.Bad.TLabel"
         )
+        self.health_lbl.config(text=f"health: {self.health_state}", style=style)
         counts = self.sm.active_counts()
         u = self.state["uac"]
         u["active"] = counts["uac"]
@@ -420,7 +448,10 @@ class App(tk.Tk):
             self.mon_start_btn.state(["!disabled" if enable_mon else "disabled"])
             self.mon_stop_btn.state(["disabled"])
 
-        base_enabled = self.health_ok or self.vars.get("ignore_health", tk.BooleanVar()).get()
+        base_enabled = (
+            self.health_state == "OK"
+            or self.vars.get("ignore_health", tk.BooleanVar()).get()
+        )
         if not dest_ok:
             base_enabled = False
         self.load_btn.state(["!disabled" if base_enabled else "disabled"])
@@ -459,7 +490,7 @@ class App(tk.Tk):
             call_enabled = dest_ok and identity_ok
             if (
                 self.vars.get("require_health_call", tk.BooleanVar(value=True)).get()
-                and not self.health_ok
+                and self.health_state != "OK"
             ):
                 call_enabled = False
             self.call_btn.state(["!disabled" if call_enabled else "disabled"])
@@ -589,6 +620,7 @@ class App(tk.Tk):
     def reset_options_monitor(self):
         self.state["options"] = {"sent": 0, "ok": 0, "other": 0, "timeout": 0, "last": "-", "rx": 0}
         self.event_q.put(("options_metrics", self.state["options"].copy()))
+        self.fail_streak = 0
 
     def copy_cli_command(self):
         bind_ip = (self.vars.get("bind_ip").get() or "0.0.0.0").strip()
@@ -653,8 +685,10 @@ class App(tk.Tk):
         t.start()
 
     def start_load(self):
-        if not self.health_ok and not self.vars["ignore_health"].get():
-            messagebox.showwarning("Health", "OPTIONS fallido: no se puede iniciar generador")
+        if self.health_state != "OK" and not self.vars["ignore_health"].get():
+            messagebox.showwarning(
+                "Health", "OPTIONS fallido: no se puede iniciar generador"
+            )
             return
         cfg = self.get_config()
         if not cfg:
@@ -848,6 +882,7 @@ class OptionsMonitorWorker(threading.Thread):
                     counters["other"] += 1
                     counters["last"] = str(code)
                     self.event_q.put(("log", f"OPTIONS {code}"))
+            counters["ts"] = time.monotonic()
             self.event_q.put(("options_metrics", counters.copy()))
             self.cseq += 1
             if self._stop.wait(self.interval):
@@ -855,7 +890,7 @@ class OptionsMonitorWorker(threading.Thread):
         self.event_q.put(("log", "OPTIONS monitor stopped"))
 
 def options_worker(cfg, event_q):
-    counters = {"sent": 0, "ok": 0, "other": 0, "timeout": 0}
+    counters = {"sent": 0, "ok": 0, "other": 0, "timeout": 0, "last": "-"}
     sm = SIPManager(protocol="udp")
     dst = cfg.get("dst_host")
     dport = int(cfg.get("dst_port", 5060))
@@ -874,19 +909,22 @@ def options_worker(cfg, event_q):
             )
         except OSError as exc:
             if getattr(exc, "errno", None) == 111:
-                event_q.put(
-                    ("log", f"Destino no escucha en {dst}:{dport}")
-                )
+                event_q.put(("log", f"Destino no escucha en {dst}:{dport}"))
             else:
                 event_q.put(("log", f"OPTIONS error: {exc}"))
             counters["other"] += 1
+            counters["last"] = "error"
         else:
             if code is None:
                 counters["timeout"] += 1
+                counters["last"] = "timeout"
             elif code == 200:
                 counters["ok"] += 1
+                counters["last"] = "200"
             else:
                 counters["other"] += 1
+                counters["last"] = str(code)
+        counters["ts"] = time.monotonic()
         event_q.put(("options", counters.copy()))
         time.sleep(0.5)
     event_q.put(("log", "OPTIONS test finished"))
