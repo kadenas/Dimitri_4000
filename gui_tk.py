@@ -10,7 +10,7 @@ from tkinter import ttk, messagebox, filedialog
 from types import SimpleNamespace
 import uuid
 
-from sdp import build_sdp, parse_sdp, PT_FROM_CODEC_NAME
+from sdp import build_sdp, parse_sdp, PT_FROM_CODEC_NAME, build_sdp_offer
 
 from sip_manager import (
     SIPManager,
@@ -291,7 +291,7 @@ class App(tk.Tk):
         btn_frame.pack(fill="x")
         self.opt_btn = ttk.Button(btn_frame, text="Probar OPTIONS", command=self.start_options)
         self.uas_btn = ttk.Button(btn_frame, text="Iniciar UAS", command=self.toggle_uas)
-        self.call_btn = ttk.Button(btn_frame, text="Llamada UAC", command=self.start_call)
+        self.call_btn = ttk.Button(btn_frame, text="Llamada UAC", command=self.on_uac_call_clicked)
         self.load_btn = ttk.Button(btn_frame, text="Generador", command=self.start_load)
         self.bye_uac_btn = ttk.Button(btn_frame, text="BYE todas (UAC)", command=self.on_bye_all_uac)
         self.bye_uas_btn = ttk.Button(btn_frame, text="BYE todas (UAS)", command=self.on_bye_all_uas)
@@ -709,6 +709,105 @@ class App(tk.Tk):
         t = threading.Thread(target=options_worker, args=(cfg, self.event_q))
         t.daemon = True
         t.start()
+
+    def on_uac_call_clicked(self):
+        dst_host = (self.vars.get("dst_host").get() or "").strip()
+        try:
+            dst_port = int(self.vars.get("dst_port").get() or 0)
+        except Exception:
+            dst_port = 0
+        if not dst_host or not dst_port:
+            self.log("UAC: faltan dst_host/dst_port")
+            return
+
+        from_num = (self.vars.get("from_number").get() or "").strip()
+        from_dom = (self.vars.get("from_domain").get() or "").strip()
+        to_num = (self.vars.get("to_number").get() or "").strip()
+        to_dom = (self.vars.get("to_domain").get() or "").strip()
+        from_uri = (self.vars.get("from_uri").get() or "") or f"{from_num}@{from_dom}"
+        to_uri = (self.vars.get("to_uri").get() or "") or f"{to_num}@{to_dom}"
+
+        codecs_csv = (self.vars.get("codecs").get() or "pcmu,pcma")
+        codec_names = [c.strip().lower() for c in codecs_csv.split(",") if c.strip()]
+        codec_pts = []
+        for name in codec_names:
+            pt = PT_FROM_CODEC_NAME.get(name)
+            if pt is not None:
+                codec_pts.append((pt, name.upper()))
+        if not codec_pts:
+            codec_pts = [(0, "PCMU"), (8, "PCMA")]
+        try:
+            rtp_base = int(self.vars.get("rtp_port_base").get() or 40000)
+        except Exception:
+            rtp_base = 40000
+        try:
+            tone_hz = int(self.vars.get("tone_hz").get() or 0)
+        except Exception:
+            tone_hz = 0
+        send_silence = bool(self.vars.get("send_silence").get())
+        try:
+            stats_every = float(self.vars.get("rtp_stats_every").get() or 2.0)
+        except Exception:
+            stats_every = 2.0
+
+        ring_timeout = float(self.vars["ring_timeout"].get()) if "ring_timeout" in self.vars else 10.0
+        wait_bye = bool(self.vars.get("wait_bye").get())
+
+        sock = self._ensure_shared_sock()
+        local_ip, _ = sock.getsockname()
+        if local_ip == "0.0.0.0":
+            try:
+                sock.connect((dst_host, dst_port))
+                local_ip = sock.getsockname()[0]
+                sock.connect(("0.0.0.0", 0))
+            except Exception:
+                pass
+
+        sdp_offer = build_sdp_offer(local_ip, rtp_base, codec_pts).decode()
+
+        try:
+            from sip_manager import SIPManager
+        except Exception:
+            self.log("UAC: no se pudo importar SIPManager")
+            return
+
+        sm = SIPManager(sock=sock, logger=logging.getLogger("gui"))
+        self.sm = sm
+
+        self.log(
+            f"UAC: llamando a sip:{to_uri} via {dst_host}:{dst_port} "
+            f"sent-by={sock.getsockname()[0]}:{sock.getsockname()[1]} "
+            f"RTP={local_ip}:{rtp_base} codecs={','.join(n for _, n in codec_pts)}"
+        )
+
+        try:
+            call_id, result, setup_ms, talk_s = sm.place_call(
+                dst_host=dst_host,
+                dst_port=dst_port,
+                from_uri=f"sip:{from_uri}",
+                to_uri=f"sip:{to_uri}",
+                sdp_offer=sdp_offer,
+                codecs=codec_pts,
+                rtp_port=rtp_base,
+                rtp_port_forced=True,
+                tone_hz=tone_hz,
+                send_silence=send_silence,
+                stats_interval=stats_every,
+                ring_timeout=ring_timeout,
+                wait_bye=wait_bye,
+            )
+            self.log(
+                f"UAC: call_id={call_id} result={result} setup={setup_ms}ms talk={talk_s}s"
+            )
+        except OSError as e:
+            if getattr(e, "errno", None) == 111:
+                self.log(
+                    f"UAC: destino no escucha en {dst_host}:{dst_port} (Connection refused)"
+                )
+            else:
+                self.log(f"UAC: error de socket: {e}")
+        except Exception as e:  # noqa: BLE001
+            self.log(f"UAC: excepción: {e}")
 
     def start_call(self):
         cfg = self.get_config()

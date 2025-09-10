@@ -422,14 +422,43 @@ class SIPManager:
         self,
         protocol: str = "udp",
         sock: socket.socket | None = None,
+        bind_ip: str = "0.0.0.0",
+        src_port: int = 0,
         logger: logging.Logger | None = None,
     ):
         self.protocol = protocol
-        self.sock = sock
         self.logger = logger or logging.getLogger("socket_handler")
+        if sock is None:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if src_port:
+                sock.bind((bind_ip, src_port))
+            self._own_sock = True
+        else:
+            self._own_sock = False
+        self.sock = sock
+        self.sock.settimeout(2.0)
         # dialogs indexed by Call-ID for UAC and UAS roles
         self.dialogs_uac: Dict[str, Dialog] = {}
         self.dialogs_uas: Dict[str, Dialog] = {}
+        self.cseq_invite = 1
+        self.cseq_bye = 1
+        self.cseq_options = 1
+
+    def _local_ip_port(
+        self,
+        sock: socket.socket,
+        dst_host: str | None = None,
+        dst_port: int | None = None,
+    ) -> tuple[str, int]:
+        ip, port = sock.getsockname()
+        if ip == "0.0.0.0" and dst_host and dst_port:
+            try:
+                sock.connect((dst_host, dst_port))
+                ip = sock.getsockname()[0]
+                sock.connect(("0.0.0.0", 0))
+            except Exception:
+                pass
+        return ip, port
 
     def _open_connected_udp(
         self,
@@ -524,6 +553,7 @@ class SIPManager:
         wait_bye: bool = False,
         max_call_time: float = 0.0,
         codecs: list[tuple[int, str]] | None = None,
+        sdp_offer: bytes | str | None = None,
         rtp_port: int = 40000,
         rtp_port_forced: bool = False,
         rtcp: bool = False,
@@ -549,12 +579,13 @@ class SIPManager:
                         f"Destino no escucha en {dst_host}:{dst_port}"
                     )
                 raise
-            local_ip, local_port = s.getsockname()
+            local_ip, local_port = self._local_ip_port(s, dst_host, dst_port)
             s.settimeout(0.5)
         else:
             s, local_ip, local_port = self._open_connected_udp(
                 dst_host, dst_port, bind_ip, bind_port
             )
+            local_ip, local_port = self._local_ip_port(s, dst_host, dst_port)
             s.settimeout(0.5)
             owned_socket = True
 
@@ -590,7 +621,10 @@ class SIPManager:
         tag = uuid.uuid4().hex[:8]
         codecs = codecs or [(0, "PCMU"), (8, "PCMA")]
         pt_list = [pt for pt, _ in codecs]
-        sdp_bytes = build_sdp_offer(local_ip, rtp_port, codecs)
+        if sdp_offer is not None:
+            sdp_bytes = sdp_offer if isinstance(sdp_offer, bytes) else sdp_offer.encode()
+        else:
+            sdp_bytes = build_sdp_offer(local_ip, rtp_port, codecs)
         logger.info("Offer SDP PTs=%s; supported locally=[0,8]", pt_list)
         sdp_str = sdp_bytes.decode()
         invite = build_invite(
