@@ -9,7 +9,7 @@ import errno
 from dataclasses import dataclass
 from typing import Dict, Tuple
 from rtp import RtpSession
-from sdp import build_sdp, parse_sdp, CODEC_NAME_FROM_PT
+from sdp import build_sdp_offer, build_sdp_answer, parse_sdp, CODEC_NAME_FROM_PT
 
 logger = logging.getLogger("socket_handler")
 
@@ -590,7 +590,7 @@ class SIPManager:
         tag = uuid.uuid4().hex[:8]
         codecs = codecs or [(0, "PCMU"), (8, "PCMA")]
         pt_list = [pt for pt, _ in codecs]
-        sdp_bytes = build_sdp(local_ip, rtp_port, codecs)
+        sdp_bytes = build_sdp_offer(local_ip, rtp_port, codecs)
         logger.info("Offer SDP PTs=%s; supported locally=[0,8]", pt_list)
         sdp_str = sdp_bytes.decode()
         invite = build_invite(

@@ -36,6 +36,16 @@ def build_sdp(
     return "".join(lines).encode()
 
 
+def build_sdp_offer(ip: str, rtp_port: int, codecs: Iterable[Tuple[int, str]]) -> bytes:
+    """Wrapper for backward compatibility to build SDP offers."""
+    return build_sdp(ip, rtp_port, codecs)
+
+
+def build_sdp_answer(ip: str, rtp_port: int, codecs: Iterable[Tuple[int, str]]) -> bytes:
+    """Wrapper for backward compatibility to build SDP answers."""
+    return build_sdp(ip, rtp_port, codecs)
+
+
 def parse_sdp(body: bytes | str) -> Dict:
     """Parse minimal SDP returning connection info and codec mappings."""
     if isinstance(body, bytes):
