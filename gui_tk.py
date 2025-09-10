@@ -511,28 +511,49 @@ class App(tk.Tk):
     def start_options_monitor(self):
         if getattr(self, "options_thread", None) and self.options_thread.is_alive():
             return
-        cfg = self.get_config()
-        if not cfg:
-            return
-        interval = cfg.get("interval", 1.0)
+
+        bind_ip = (self.vars.get("bind_ip").get() or "0.0.0.0").strip()
+        dst_host = (self.vars.get("dst_host").get() or "").strip()
+        try:
+            dst_port = int(self.vars.get("dst_port").get() or 0)
+        except Exception:
+            dst_port = 0
+        try:
+            src_port = int(self.vars.get("src_port").get() or 0)
+        except Exception:
+            src_port = 0
+        try:
+            interval = float(self.vars.get("interval").get() or 1.0)
+        except Exception:
+            interval = 1.0
+        try:
+            timeout = float(self.vars.get("timeout").get() or 2.0)
+        except Exception:
+            timeout = 2.0
+        try:
+            cseq_start = int(self.vars.get("cseq_start").get() or 1)
+        except Exception:
+            cseq_start = 1
+
+        use_src = bool(self.vars.get("use_src_port_options").get())
+        reply_opt = bool(self.vars.get("reply_options").get())
+
         if interval <= 0:
+            interval = 1.0
+        if timeout <= 0:
+            timeout = 2.0
+        if cseq_start < 1:
+            cseq_start = 1
+        if not dst_host or dst_port <= 0:
+            logging.info("OPTIONS: destino incompleto (host/puerto).")
             return
-        bind_ip = cfg.get("bind_ip") or None
-        dst_host = cfg.get("dst_host")
-        dst_port = int(cfg.get("dst_port", 5060))
-        src_port = int(cfg.get("src_port", 0))
-        if not cfg.get("use_src_port_options", True) or (
-            reply_opt and src_port
-        ):
-            send_port = 0
-        else:
-            send_port = src_port
-        timeout = cfg.get("timeout", 2.0)
-        cseq_start = int(cfg.get("cseq_start", 1))
-        reply_opt = cfg.get("reply_options", False)
+
+        send_from_port = src_port if use_src else 0
+        reply_on_port = src_port if reply_opt else 0
+
         self.options_thread = OptionsMonitorWorker(
             bind_ip,
-            send_port,
+            send_from_port,
             dst_host,
             dst_port,
             interval,
@@ -543,9 +564,14 @@ class App(tk.Tk):
         )
         self.options_thread.start()
         if reply_opt:
-            self.options_responder = OptionsResponder(bind_ip, src_port, self.event_q)
+            self.options_responder = OptionsResponder(bind_ip, reply_on_port, self.event_q)
             self.options_responder.start()
         self.monitor_status_lbl.config(text="monitor: ACTIVO", style="Status.OK.TLabel")
+        logging.info(
+            f"OPTIONS monitor started dst={dst_host}:{dst_port} every {interval}s "
+            f"from {bind_ip}:{send_from_port or 'ephemeral'} "
+            f"{'(responder ON)' if reply_opt else '(responder OFF)'}"
+        )
         self.update_button_states()
 
     def stop_options_monitor(self):
@@ -565,41 +591,51 @@ class App(tk.Tk):
         self.event_q.put(("options_metrics", self.state["options"].copy()))
 
     def copy_cli_command(self):
-        cfg = self.get_config()
-        if not cfg:
-            return
-        bind_ip = cfg.get("bind_ip")
-        src_port = int(cfg.get("src_port", 0))
-        if not cfg.get("use_src_port_options", True):
+        bind_ip = (self.vars.get("bind_ip").get() or "0.0.0.0").strip()
+        dst_host = (self.vars.get("dst_host").get() or "").strip()
+        try:
+            src_port = int(self.vars.get("src_port").get() or 0)
+        except Exception:
+            src_port = 0
+        try:
+            dst_port = int(self.vars.get("dst_port").get() or 0)
+        except Exception:
+            dst_port = 0
+        try:
+            interval = float(self.vars.get("interval").get() or 1.0)
+        except Exception:
+            interval = 1.0
+        try:
+            cseq = int(self.vars.get("cseq_start").get() or 1)
+        except Exception:
+            cseq = 1
+        reply_opt = bool(self.vars.get("reply_options").get())
+        use_src = bool(self.vars.get("use_src_port_options").get())
+        if not use_src:
             src_port = 0
         parts = [
             "python",
             "app.py",
+            "--single-socket",
             "--service",
-        ]
-        if cfg.get("reply_options", False):
-            parts.append("--reply-options")
-        if bind_ip:
-            parts.extend(["--bind-ip", str(bind_ip)])
-        parts.extend([
+            "--reply-options" if reply_opt else "",
+            "--bind-ip",
+            bind_ip,
             "--src-port",
             str(src_port),
             "--dst",
-            cfg.get("dst_host", ""),
+            dst_host,
             "--dst-port",
-            str(int(cfg.get("dst_port", 5060))),
+            str(dst_port),
             "--interval",
-            str(cfg.get("interval", 1.0)),
-            "--timeout",
-            str(cfg.get("timeout", 2.0)),
+            str(interval),
             "--cseq-start",
-            str(int(cfg.get("cseq_start", 1))),
-        ])
-        cmd = " ".join(parts)
+            str(cseq),
+        ]
+        cmd = " ".join(p for p in parts if p)
         self.clipboard_clear()
         self.clipboard_append(cmd)
-        print(cmd)
-        self.event_q.put(("log", cmd))
+        self.event_q.put(("log", f"CLI: {cmd}"))
         self.event_q.put(("log", "Comando copiado al portapapeles"))
 
     def start_options(self):
