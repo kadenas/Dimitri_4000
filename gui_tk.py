@@ -582,16 +582,21 @@ class App(tk.Tk):
         send_from_port = src_port if use_src else 0
         reply_on_port = src_port if reply_opt else 0
 
-        self.options_thread = OptionsMonitorWorker(
-            bind_ip,
-            send_from_port,
-            dst_host,
-            dst_port,
-            interval,
-            timeout,
-            cseq_start,
-            reply_opt,
-            self.event_q,
+        def pub(payload):
+            """Publish events coming from monitor thread to GUI queue."""
+            self.event_q.put((payload.pop("type"), payload))
+
+        self.options_thread = OptionsMonitorThread(
+            bind_ip=bind_ip,
+            src_port=send_from_port,
+            dst_host=dst_host,
+            dst_port=dst_port,
+            interval=interval,
+            timeout=timeout,
+            cseq_start=cseq_start,
+            use_src_for_send=use_src,
+            reply_options=reply_opt,
+            publish_event=pub,
         )
         self.options_thread.start()
         if reply_opt:
@@ -607,7 +612,7 @@ class App(tk.Tk):
 
     def stop_options_monitor(self):
         if getattr(self, "options_thread", None):
-            self.options_thread.stop()
+            self.options_thread.stop_evt.set()
             self.options_thread.join(timeout=1)
             self.options_thread = None
         if getattr(self, "options_responder", None):
@@ -761,10 +766,10 @@ class OptionsResponder(threading.Thread):
         self.bind_ip = bind_ip or "0.0.0.0"
         self.src_port = src_port
         self.event_q = event_q
-        self._stop = threading.Event()
+        self.stop_evt = threading.Event()
 
     def stop(self):
-        self._stop.set()
+        self.stop_evt.set()
 
     def run(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -777,7 +782,7 @@ class OptionsResponder(threading.Thread):
         sock.bind((self.bind_ip, self.src_port))
         sock.settimeout(0.5)
         count = 0
-        while not self._stop.is_set():
+        while not self.stop_evt.is_set():
             try:
                 data, addr = sock.recvfrom(4096)
             except socket.timeout:
@@ -817,9 +822,12 @@ class OptionsResponder(threading.Thread):
         sock.close()
 
 
-class OptionsMonitorWorker(threading.Thread):
+class OptionsMonitorThread(threading.Thread):
+    """Monitor thread sending SIP OPTIONS using a persistent UDP socket."""
+
     def __init__(
         self,
+        *,
         bind_ip,
         src_port,
         dst_host,
@@ -827,67 +835,96 @@ class OptionsMonitorWorker(threading.Thread):
         interval,
         timeout,
         cseq_start,
-        reply_options_enabled,
-        event_q,
+        use_src_for_send,
+        reply_options,
+        publish_event,
     ):
         super().__init__(daemon=True)
-        self.bind_ip = bind_ip
-        self.src_port = src_port
-        self.dst_host = dst_host
-        self.dst_port = dst_port
-        self.interval = interval
-        self.timeout = timeout
-        self.cseq = cseq_start
-        self.reply_options_enabled = reply_options_enabled
-        self.event_q = event_q
-        self._stop = threading.Event()
+        self.bind_ip = bind_ip or "0.0.0.0"
+        self.src_port = int(src_port or 0)
+        self.dst = (dst_host, int(dst_port))
+        self.interval = max(float(interval or 1.0), 0.05)
+        self.timeout = max(float(timeout or 2.0), 0.1)
+        self.cseq = int(cseq_start or 1)
+        self.use_src = bool(use_src_for_send)
+        self.reply = bool(reply_options)
+        self.publish_event = publish_event
+        self.stop_evt = threading.Event()
+        self.sock = None
+        self.sent = 0
+        self.ok200 = 0
+        self.other = 0
+        self.timeouts = 0
+        self.last = None
 
-    def stop(self):
-        self._stop.set()
+    def _build_options(self, local_ip, local_port, cseq):
+        call_id = f"mon{int(time.time()*1000)}@{local_ip}"
+        via = (
+            f"Via: SIP/2.0/UDP {local_ip}:{local_port};branch=z9hG4bK{cseq};rport\r\n"
+        )
+        msg = (
+            f"OPTIONS sip:{self.dst[0]} SIP/2.0\r\n"
+            + via
+            + "Max-Forwards: 70\r\n"
+            + f"From: <sip:mon@{local_ip}>;tag=mon\r\n"
+            + f"To: <sip:{self.dst[0]}>\r\n"
+            + f"Call-ID: {call_id}\r\n"
+            + f"CSeq: {cseq} OPTIONS\r\n"
+            + f"Contact: <sip:mon@{local_ip}>\r\n"
+            + "User-Agent: Dimitri-4000/0.1\r\n"
+            + "Content-Length: 0\r\n"
+            + "\r\n"
+        )
+        return msg.encode("ascii", "ignore")
 
     def run(self):
-        sm = SIPManager(protocol="udp")
-        self.event_q.put(
-            (
-                "log",
-                f"OPTIONS monitor started dst={self.dst_host}:{self.dst_port} every {self.interval}s from {self.bind_ip or '0.0.0.0'}:{self.src_port or 'ephemeral'}",
-            )
-        )
-        counters = {"sent": 0, "ok": 0, "other": 0, "timeout": 0, "last": "-"}
-        while not self._stop.is_set():
-            counters["sent"] += 1
-            try:
-                code, _, _ = sm.send_request(
-                    dst_host=self.dst_host,
-                    dst_port=self.dst_port,
-                    timeout=self.timeout,
-                    bind_ip=self.bind_ip,
-                    bind_port=self.src_port,
-                    cseq=self.cseq,
-                )
-            except OSError as exc:
-                counters["other"] += 1
-                counters["last"] = "error"
-                self.event_q.put(("log", f"OPTIONS error: {exc}"))
-            else:
-                if code is None:
-                    counters["timeout"] += 1
-                    counters["last"] = "timeout"
-                    self.event_q.put(("log", "OPTIONS timeout"))
-                elif code == 200:
-                    counters["ok"] += 1
-                    counters["last"] = "200"
-                    self.event_q.put(("log", "OPTIONS 200"))
-                else:
-                    counters["other"] += 1
-                    counters["last"] = str(code)
-                    self.event_q.put(("log", f"OPTIONS {code}"))
-            counters["ts"] = time.monotonic()
-            self.event_q.put(("options_metrics", counters.copy()))
-            self.cseq += 1
-            if self._stop.wait(self.interval):
-                break
-        self.event_q.put(("log", "OPTIONS monitor stopped"))
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if self.use_src and self.src_port > 0:
+                self.sock.bind((self.bind_ip, self.src_port))
+            self.sock.settimeout(self.timeout)
+
+            while not self.stop_evt.is_set():
+                local_ip, local_port = self.sock.getsockname()
+                payload = self._build_options(local_ip, local_port, self.cseq)
+                try:
+                    self.sock.sendto(payload, self.dst)
+                    self.sent += 1
+                    data, _ = self.sock.recvfrom(4096)
+                    if data.startswith(b"SIP/2.0 200"):
+                        self.ok200 += 1
+                        self.last = "200"
+                    else:
+                        self.other += 1
+                        self.last = "other"
+                except socket.timeout:
+                    self.timeouts += 1
+                    self.last = "timeout"
+
+                if self.publish_event:
+                    self.publish_event(
+                        {
+                            "type": "options_metrics",
+                            "sent": self.sent,
+                            "ok": self.ok200,
+                            "other": self.other,
+                            "timeout": self.timeouts,
+                            "last": self.last,
+                        }
+                    )
+
+                if self.stop_evt.wait(self.interval):
+                    break
+
+        finally:
+            if self.sock:
+                try:
+                    self.sock.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            if self.publish_event:
+                self.publish_event({"type": "options_stopped"})
+
 
 def options_worker(cfg, event_q):
     counters = {"sent": 0, "ok": 0, "other": 0, "timeout": 0, "last": "-"}
