@@ -4,6 +4,16 @@ Monitor sencillo para verificar servidores SIP mediante mensajes OPTIONS e
 INVITE. Incluye una interfaz de terminal basada en `curses` para realizar
 pruebas de latencia y observar el estado de la conexión.
 
+## Reactor y socket único
+
+La aplicación puede operar con un único socket UDP compartido gracias al
+módulo `Reactor`. Este núcleo multiplexa timers y tráfico recibido, evitando
+errores `EADDRINUSE` y simplificando el uso concurrente de UAS, UAC y el
+monitor de OPTIONS.
+
+El monitor periódico de OPTIONS se apoya en este reactor y puede iniciarse
+desde la línea de comandos con `--options-monitor` o desde la GUI.
+
 ## TUI
 
 La opción `--tui` inicia una interfaz retro en la que se pueden editar
@@ -68,6 +78,9 @@ genera y copia al portapapeles un comando equivalente, por ejemplo:
 python app.py --service --reply-options --bind-ip 0.0.0.0 --src-port 5060 \
     --dst 1.2.3.4 --dst-port 5060 --interval 1.0 --cseq-start 1
 ```
+
+Desde la línea de comandos puede utilizarse directamente `--options-monitor`
+para iniciar el latido sin necesidad de la GUI.
 
 Nota: para pruebas en la misma máquina inicia dos instancias con puertos
 distintos (por ejemplo 5060 y 5062) y activa el monitor en ambas.
