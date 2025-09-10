@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Dict, Tuple
 from rtp import RtpSession
 from sdp import build_sdp_offer, build_sdp_answer, parse_sdp, CODEC_NAME_FROM_PT
+from sdp_utils import parse_sdp_ip_port
 
 logger = logging.getLogger("socket_handler")
 
@@ -440,6 +441,9 @@ class SIPManager:
         # dialogs indexed by Call-ID for UAC and UAS roles
         self.dialogs_uac: Dict[str, Dialog] = {}
         self.dialogs_uas: Dict[str, Dialog] = {}
+        # expose dictionaries with generic names for GUI helpers
+        self.uac_dialogs = self.dialogs_uac
+        self.uas_dialogs = self.dialogs_uas
         self.cseq_invite = 1
         self.cseq_bye = 1
         self.cseq_options = 1
@@ -962,8 +966,11 @@ class SIPManager:
                     if b"\r\n\r\n" in data:
                         body = data.split(b"\r\n\r\n", 1)[1]
                     sdp_info = parse_sdp(body)
-                    remote_ip = sdp_info.get("ip") or dst_host
-                    remote_port = sdp_info.get("audio_port") or rtp_port
+                    try:
+                        remote_ip, remote_port = parse_sdp_ip_port(body)
+                    except ValueError:
+                        remote_ip = sdp_info.get("ip") or dst_host
+                        remote_port = sdp_info.get("audio_port") or rtp_port
                     pts = sdp_info.get("pts") or []
                     payload_pt = pts[0] if pts else pt_list[0]
                     codec_name = sdp_info.get("rtpmap", {}).get(
@@ -1234,6 +1241,18 @@ class SIPManager:
                 dialogs.pop(key, None)
                 count += 1
         return count
+
+    def bye_all_uac(self, timeout: float = 3.0) -> int:
+        """Convenience wrapper to BYE all active UAC dialogs."""
+        return self.bye_all("uac", timeout)
+
+    def bye_all_uas(self, timeout: float = 3.0) -> int:
+        """Convenience wrapper to BYE all active UAS dialogs."""
+        return self.bye_all("uas", timeout)
+
+    def uac_active_count(self) -> int:
+        """Return number of active UAC dialogs."""
+        return len(self.dialogs_uac)
 
     def active_counts(self) -> dict:
         """Return a dictionary with active dialog counts."""

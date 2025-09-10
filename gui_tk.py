@@ -11,6 +11,8 @@ from types import SimpleNamespace
 import uuid
 
 from sdp import build_sdp, parse_sdp, PT_FROM_CODEC_NAME, build_sdp_offer
+from sdp_utils import parse_sdp_ip_port
+from rtp import RtpSession
 
 from sip_manager import (
     SIPManager,
@@ -22,6 +24,7 @@ from sip_manager import (
     build_ringing,
     build_200,
     build_487,
+    Dialog,
 )
 from app import run_load_generator
 
@@ -322,7 +325,7 @@ class App(tk.Tk):
         scroll.pack(side="right", fill="y")
         self.log_text['yscrollcommand'] = scroll.set
         ttk.Button(status, text="Guardar log...", command=self.save_log).pack(anchor="e")
-        self.update_button_states()
+        self._refresh_buttons_state()
 
     # helpers -----------------------------------------------------------
     def _add_entry(self, parent, key, row, cfg, show=None):
@@ -393,7 +396,7 @@ class App(tk.Tk):
             elif kind == "uas":
                 self.state["uas"].update(data)
         self._refresh_status()
-        self.update_button_states()
+        self._refresh_buttons_state()
         self.after(200, self._process_events)
 
     def _refresh_status(self):
@@ -526,6 +529,28 @@ class App(tk.Tk):
         self.bye_uac_btn.state(["!disabled" if counts["uac"] > 0 else "disabled"])
         self.bye_uas_btn.state(["!disabled" if counts["uas"] > 0 else "disabled"])
 
+    def _set_uac_buttons(self, active: bool):
+        try:
+            self.call_btn.configure(state=("normal" if active else "disabled"))
+        except Exception:
+            pass
+
+    def _refresh_buttons_state(self):
+        self.update_button_states()
+        if getattr(self, "_uac_running", False):
+            try:
+                self.call_btn.configure(state="disabled")
+            except Exception:
+                pass
+        sm = getattr(self, "_sm_for_gui", None)
+        try:
+            if sm and sm.uac_active_count() > 0:
+                self.bye_uac_btn.configure(state="normal")
+            else:
+                self.bye_uac_btn.configure(state="disabled")
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     def get_config(self):
         cfg = {k: v.get() for k, v in self.vars.items()}
@@ -633,7 +658,7 @@ class App(tk.Tk):
             f"from {sock.getsockname()[0]}:{sock.getsockname()[1]} "
             f"{'(responder ON)' if reply_opt else '(responder OFF)'}"
         )
-        self.update_button_states()
+        self._refresh_buttons_state()
 
     def stop_options_monitor(self):
         if getattr(self, "options_thread", None):
@@ -642,7 +667,7 @@ class App(tk.Tk):
             self.options_thread = None
         self._close_shared_sock()
         self.monitor_status_lbl.config(text="monitor: PARADO", style="Status.Warn.TLabel")
-        self.update_button_states()
+        self._refresh_buttons_state()
 
     def reset_options_monitor(self):
         self.state["options"] = {
@@ -711,6 +736,23 @@ class App(tk.Tk):
         t.start()
 
     def on_uac_call_clicked(self):
+        if getattr(self, "_uac_running", False):
+            return
+        self._uac_running = True
+        self._set_uac_buttons(active=False)
+        t = threading.Thread(target=self._uac_worker, daemon=True)
+        t.start()
+
+    def _uac_worker(self):
+        try:
+            result = self._do_uac_call_once()
+            if result is not None:
+                self.log(f"UAC: resultado {result}")
+        finally:
+            self._uac_running = False
+            self.after(0, self._refresh_buttons_state)
+
+    def _do_uac_call_once(self):
         dst_host = (self.vars.get("dst_host").get() or "").strip()
         try:
             dst_port = int(self.vars.get("dst_port").get() or 0)
@@ -773,6 +815,7 @@ class App(tk.Tk):
 
         sm = SIPManager(sock=sock, logger=logging.getLogger("gui"))
         self.sm = sm
+        self._sm_for_gui = sm
 
         self.log(
             f"UAC: llamando a sip:{to_uri} via {dst_host}:{dst_port} "
@@ -799,6 +842,7 @@ class App(tk.Tk):
             self.log(
                 f"UAC: call_id={call_id} result={result} setup={setup_ms}ms talk={talk_s}s"
             )
+            return result
         except OSError as e:
             if getattr(e, "errno", None) == 111:
                 self.log(
@@ -806,8 +850,10 @@ class App(tk.Tk):
                 )
             else:
                 self.log(f"UAC: error de socket: {e}")
+            return "socket-error"
         except Exception as e:  # noqa: BLE001
             self.log(f"UAC: excepción: {e}")
+            return "exception"
 
     def start_call(self):
         cfg = self.get_config()
@@ -847,6 +893,7 @@ class App(tk.Tk):
                 return
             sock = self._ensure_shared_sock()
             self.sm = SIPManager(sock=sock)
+            self._sm_for_gui = self.sm
             self.stop_event.clear()
             self.uas_thread = threading.Thread(
                 target=uas_worker,
@@ -869,7 +916,7 @@ class App(tk.Tk):
         # send BYE for any pending dialogs
         self.sm.bye_all("uac")
         self.sm.bye_all("uas")
-        self.update_button_states()
+        self._refresh_buttons_state()
 
     def _ensure_shared_sock(self, bind_ip=None, src_port=None):
         """Crea (si no existe) y devuelve el socket UDP compartido bind al bind_ip/src_port."""
@@ -905,14 +952,16 @@ class App(tk.Tk):
         self._shared_sock = None
 
     def on_bye_all_uac(self):
-        t = threading.Thread(target=bye_all_worker, args=(self.sm, "uac", self.event_q))
-        t.daemon = True
-        t.start()
+        sm = getattr(self, "_sm_for_gui", None)
+        if sm:
+            sm.bye_all_uac()
+        self._refresh_buttons_state()
 
     def on_bye_all_uas(self):
-        t = threading.Thread(target=bye_all_worker, args=(self.sm, "uas", self.event_q))
-        t.daemon = True
-        t.start()
+        sm = getattr(self, "_sm_for_gui", None)
+        if sm:
+            sm.bye_all_uas()
+        self._refresh_buttons_state()
 
     def save_log(self):
         path = filedialog.asksaveasfilename(defaultextension=".log")
@@ -1232,6 +1281,15 @@ def uas_worker(cfg, event_q, stop_event, sm):
         codecs = [(0, "PCMU"), (8, "PCMA")]
     local_ip = sock.getsockname()[0]
     rtp_port = int(cfg.get("rtp_port_base", "40000"))
+    try:
+        tone_hz = int(cfg.get("tone_hz", "0"))
+    except Exception:
+        tone_hz = 0
+    send_silence = bool(cfg.get("send_silence", False))
+    try:
+        stats_every = float(cfg.get("rtp_stats_every", "2.0") or 2.0)
+    except Exception:
+        stats_every = 2.0
     dialogs = {}
     event_q.put(("log", "UAS service started"))
     try:
@@ -1281,6 +1339,10 @@ def uas_worker(cfg, event_q, stop_event, sm):
                     use_codecs = [(pt, name) for pt, name in codecs if pt == common[0]]
                 else:
                     use_codecs = codecs
+                try:
+                    rem_ip, rem_port = parse_sdp_ip_port(body)
+                except ValueError:
+                    rem_ip, rem_port = addr[0], rtp_port
                 sdp_ans = build_sdp(local_ip, rtp_port, use_codecs)
                 headers200 = headers_base.copy()
                 headers200.update(
@@ -1292,9 +1354,32 @@ def uas_worker(cfg, event_q, stop_event, sm):
                     }
                 )
                 sock.sendto(build_200(headers200, sdp_ans), addr)
-                key = (call_id, remote_tag)
-                dialogs[key] = {"local_tag": local_tag, "to_uri": to.split(";", 1)[0]}
-                event_q.put(("uas", {"dialogs": len(dialogs)}))
+                rtp = None
+                if send_silence or tone_hz > 0:
+                    try:
+                        rtp = RtpSession(local_ip, rtp_port, use_codecs[0][0], forced=True)
+                        rtp.tone_hz = tone_hz
+                        rtp.send_silence = send_silence and not tone_hz
+                        rtp.stats_interval = stats_every
+                        rtp.start(rem_ip, rem_port)
+                    except Exception:
+                        rtp = None
+                dialogs[call_id] = {"local_tag": local_tag, "to_uri": to.split(";", 1)[0], "rtp": rtp}
+                sm.dialogs_uas[call_id] = Dialog(
+                    local_tag=local_tag,
+                    remote_tag=remote_tag or "",
+                    call_id=call_id,
+                    from_uri=fr.split(";", 1)[0],
+                    to_uri=to.split(";", 1)[0],
+                    route_set=[],
+                    remote_target=headers.get("contact", fr.split(";", 1)[0]),
+                    sock=sock,
+                    our_next_cseq=int(cseq_hdr.split()[0]) + 1,
+                    local_ip=local_ip,
+                    local_port=sock.getsockname()[1],
+                    role="uas",
+                )
+                event_q.put(("uas", {"dialogs": len(sm.dialogs_uas)}))
             elif start.startswith("BYE "):
                 try:
                     via = headers["via"]
@@ -1304,15 +1389,18 @@ def uas_worker(cfg, event_q, stop_event, sm):
                     cseq_hdr = headers["cseq"]
                 except KeyError:
                     continue
-                remote_tag = None
-                if "tag=" in fr.lower():
-                    remote_tag = fr.split("tag=")[1].split(";", 1)[0]
-                key = (call_id, remote_tag)
-                info = dialogs.pop(key, None)
+                info = dialogs.pop(call_id, None)
+                sm.dialogs_uas.pop(call_id, None)
                 to_resp = to
                 if info:
                     to_resp = f"{info['to_uri']};tag={info['local_tag']}"
-                    event_q.put(("uas", {"dialogs": len(dialogs)}))
+                    try:
+                        rtp = info.get("rtp")
+                        if rtp:
+                            rtp.stop()
+                    except Exception:
+                        pass
+                    event_q.put(("uas", {"dialogs": len(sm.dialogs_uas)}))
                 headers200 = {
                     "Via": via,
                     "From": fr,
