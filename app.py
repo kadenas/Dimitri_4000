@@ -32,6 +32,8 @@ from sip_manager import (
 )
 from sdp import build_sdp, parse_sdp, PT_FROM_CODEC_NAME, CODEC_NAME_FROM_PT
 from rtp import RtpSession
+from core.reactor import Reactor
+from core.options_monitor import OptionsMonitor, register_options_responder
 
 
 def write_csv_row(path, row, header=None):
@@ -113,6 +115,13 @@ def parse_args():
     p.add_argument("--gui", action="store_true", help="Inicia interfaz gráfica Tkinter")
     p.add_argument("--tui", action="store_true", help="Inicia interfaz curses retro")
     p.add_argument("--uas", action="store_true", help="Habilita servidor SIP UAS")
+    p.add_argument(
+        "--single-socket",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Usar un único socket UDP compartido",
+    )
+    p.add_argument("--options-monitor", action="store_true", help="Monitor OPTIONS en CLI")
     p.add_argument(
         "--uas-ring-delay",
         type=float,
@@ -490,6 +499,32 @@ def run_load_generator(args, sip_manager, stats_cb=None):
 
 def main():
     args = parse_args()
+
+    if args.options_monitor:
+        if not args.dst:
+            raise SystemExit("Falta destino: usa --dst 10.0.0.1")
+        if not args.single_socket:
+            raise SystemExit("--options-monitor requiere --single-socket")
+        reac = Reactor(args.bind_ip or "0.0.0.0", args.src_port)
+        if args.reply_options:
+            register_options_responder(reac)
+        mon = OptionsMonitor(
+            reac,
+            dst_host=args.dst,
+            dst_port=args.dst_port,
+            interval=args.interval,
+            timeout=args.timeout,
+            cseq_start=args.cseq_start,
+        )
+        mon.start()
+        try:
+            reac.run()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            mon.stop()
+            reac.stop()
+        return
 
     if getattr(args, "gui", False):
         from gui_tk import main as gui_main
