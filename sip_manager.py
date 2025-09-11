@@ -1225,6 +1225,7 @@ class SIPManager:
         count = 0
         for key, d in list(dialogs.items()):
             branch = "z9hG4bK" + uuid.uuid4().hex
+            cseq = getattr(d, "our_next_cseq", self._new_cseq())
             lines = [
                 f"BYE {d.remote_target} SIP/2.0\r\n",
                 f"Via: SIP/2.0/UDP {d.local_ip}:{d.local_port};branch={branch};rport\r\n",
@@ -1232,7 +1233,7 @@ class SIPManager:
                 f"From: <{d.from_uri}>;tag={d.local_tag}\r\n",
                 f"To: <{d.to_uri}>;tag={d.remote_tag}\r\n",
                 f"Call-ID: {d.call_id}\r\n",
-                f"CSeq: {d.our_next_cseq} BYE\r\n",
+                f"CSeq: {cseq} BYE\r\n",
                 f"Contact: <{d.from_uri}>\r\n",
                 "User-Agent: Dimitri-4000/0.1\r\n",
             ]
@@ -1240,9 +1241,13 @@ class SIPManager:
                 lines.append(f"Route: {r}\r\n")
             lines.append("Content-Length: 0\r\n\r\n")
             msg = "".join(lines).encode()
+            dst = getattr(d, "dst", None)
             try:
-                if getattr(d, "dst", None):
-                    d.sock.sendto(msg, d.dst)
+                self.logger.info(
+                    f"{role.upper()} BYE -> {dst or d.remote_target} call_id={d.call_id} cseq={cseq}"
+                )
+                if dst:
+                    d.sock.sendto(msg, dst)
                 else:
                     d.sock.send(msg)
                 d.sock.settimeout(timeout)
@@ -1254,8 +1259,10 @@ class SIPManager:
                             break
                 except socket.timeout:
                     pass
-            except OSError:
-                pass
+            except OSError as e:
+                self.logger.error(
+                    f"{role.upper()} BYE error call_id={d.call_id}: {e}"
+                )
             finally:
                 self._safe_stop_rtp(d)
                 dialogs.pop(key, None)
