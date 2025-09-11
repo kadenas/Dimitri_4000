@@ -843,15 +843,21 @@ class App(tk.Tk):
         if getattr(self, "_uac_running", False):
             return
         self._uac_running = True
-        self._set_uac_buttons(active=False)
+        try:
+            self.call_btn.configure(state="disabled")
+        except Exception:
+            pass
         t = threading.Thread(target=self._uac_worker, daemon=True)
         t.start()
+        self.after(0, self._refresh_buttons_state)
 
     def _uac_worker(self):
         try:
             result = self._do_uac_call_once()
             if result is not None:
                 self.log(f"UAC: resultado {result}")
+        except Exception as e:  # noqa: BLE001
+            self.log(f"Call error: {e}")
         finally:
             self._uac_running = False
             self.after(0, self._refresh_buttons_state)
@@ -1522,31 +1528,8 @@ def uas_worker(cfg, event_q, stop_event, sm):
                 }
                 event_q.put(("uas", {"dialogs": len(sm.uas_dialogs)}))
             elif start.startswith("BYE "):
-                try:
-                    via = headers["via"]
-                    fr = headers["from"]
-                    to = headers["to"]
-                    call_id = headers["call-id"]
-                    cseq_hdr = headers["cseq"]
-                except KeyError:
-                    continue
-                d = sm.uas_dialogs.pop(call_id, None)
-                sm.logger.info(
-                    f"RX BYE call_id={call_id} side=UAS -> sending 200 OK & stopping RTP"
-                )
-                to_resp = to
-                if d:
-                    to_resp = f"{d['from_uri']};tag={d['from_tag']}"
-                    sm._safe_stop_rtp(d)
+                if sm.handle_uas_bye(data, addr):
                     event_q.put(("uas", {"dialogs": len(sm.uas_dialogs)}))
-                headers200 = {
-                    "Via": via,
-                    "From": fr,
-                    "To": to_resp,
-                    "Call-ID": call_id,
-                    "CSeq": cseq_hdr,
-                }
-                sock.sendto(build_200(headers200), addr)
     finally:
         event_q.put(("log", "UAS service stopped"))
 
