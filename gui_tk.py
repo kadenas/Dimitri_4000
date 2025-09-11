@@ -975,15 +975,17 @@ class App(tk.Tk):
         sm = getattr(self, "_sm_for_gui", None)
         if sm:
             sm.bye_all_uac()
+        # ensure the call button is re-enabled even if the worker got stuck
+        self._uac_running = False
         self.after(0, self._refresh_buttons_state)
-        self.log("BYE UAC enviado para todos los diálogos.")
+        self.log("BYE UAC enviado.")
 
     def on_bye_all_uas(self):
         sm = getattr(self, "_sm_for_gui", None)
         if sm:
             sm.bye_all_uas()
         self.after(0, self._refresh_buttons_state)
-        self.log("BYE UAS enviado para todos los diálogos.")
+        self.log("BYE UAS enviado.")
 
     def save_log(self):
         path = filedialog.asksaveasfilename(defaultextension=".log")
