@@ -659,7 +659,8 @@ class SIPManager:
         auth_state = {"nc": 0, "realm": auth_realm, "nonce": None, "opaque": None, "qop": "auth", "proxy": False}
 
         call_id = str(uuid.uuid4())
-        branch = "z9hG4bK" + uuid.uuid4().hex
+        # unique branch per call but keep it short for nicer logs
+        branch = "z9hG4bK" + uuid.uuid4().hex[:16]
         tag = uuid.uuid4().hex[:8]
         codecs = codecs or [(0, "PCMU"), (8, "PCMA")]
         pt_list = [pt for pt, _ in codecs]
@@ -707,6 +708,10 @@ class SIPManager:
         remote_target = request_uri
         route_set: list[str] = []
         to_header = f"<{to_uri}>"
+        # retransmission control
+        MAX_RETX = 1
+        retries = 0
+        got_provisional = False
         
         def send_bye(cseq: int) -> int:
             nonlocal to_header, remote_target
@@ -868,7 +873,12 @@ class SIPManager:
                     data = s.recv(4096)
                 except socket.timeout:
                     now = time.monotonic()
-                    if not canceled and now >= next_resend:
+                    if (
+                        not canceled
+                        and not got_provisional
+                        and now >= next_resend
+                        and retries < MAX_RETX
+                    ):
                         try:
                             s.send(invite)
                         except OSError as e:
@@ -880,6 +890,11 @@ class SIPManager:
                             raise
                         t1 = min(t1 * 2, 4.0)
                         next_resend = now + t1
+                        retries += 1
+                        continue
+                    if not got_provisional:
+                        result = "timeout"
+                        break
                     continue
                 except OSError as e:
                     if getattr(e, "errno", None) == errno.ECONNREFUSED:
@@ -891,6 +906,8 @@ class SIPManager:
 
                 code, reason = status_from_response(data)
                 start, headers = parse_headers(data)
+                if code is not None and 100 <= code < 200:
+                    got_provisional = True
 
                 if canceled:
                     if code == 200:
@@ -1244,6 +1261,41 @@ class SIPManager:
                 rtp.stop()
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    def handle_uas_bye(self, msg: bytes, addr: tuple[str, int]) -> bool:
+        """Handle an incoming BYE request on UAS side.
+
+        Sends 200 OK, stops RTP for the dialog and removes it from
+        ``uas_dialogs``. Returns ``True`` if a BYE was processed.
+        """
+        start, headers = parse_headers(msg)
+        if not start or not start.startswith("BYE "):
+            return False
+        call_id = headers.get("call-id", "")
+        resp = build_response(
+            200,
+            "OK",
+            {
+                "Via": headers.get("via", ""),
+                "From": headers.get("from", ""),
+                "To": headers.get("to", ""),
+                "Call-ID": call_id,
+                "CSeq": headers.get("cseq", ""),
+            },
+        )
+        try:
+            self.sock.sendto(resp, addr)
+        except Exception:
+            pass
+        dlg = self.uas_dialogs.pop(call_id, None)
+        if dlg:
+            self._safe_stop_rtp(dlg)
+        self.logger.info(
+            "UAS: BYE recibido, 200 OK enviado, RTP detenido. call_id=%s",
+            call_id,
+        )
+        return True
 
     # ------------------------------------------------------------------
     def bye_all(self, role: str, timeout: float = 3.0) -> int:
