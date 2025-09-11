@@ -663,12 +663,13 @@ class App(tk.Tk):
         )
         self._refresh_buttons_state()
 
-    def stop_options_monitor(self):
+    def stop_options_monitor(self, close_sock: bool = True):
         if getattr(self, "options_thread", None):
             self.options_thread.stop_evt.set()
             self.options_thread.join(timeout=1)
             self.options_thread = None
-        self._close_shared_sock()
+        if close_sock:
+            self._close_shared_sock()
         self.monitor_status_lbl.config(text="monitor: PARADO", style="Status.Warn.TLabel")
         self._refresh_buttons_state()
 
@@ -879,6 +880,7 @@ class App(tk.Tk):
             return
         sock = self._ensure_shared_sock()
         self.sm = SIPManager(sock=sock)
+        self.stop_event.clear()
         t = threading.Thread(target=load_worker, args=(cfg, self.event_q, self.stop_event, self.sm))
         t.daemon = True
         t.start()
@@ -886,41 +888,55 @@ class App(tk.Tk):
 
     def toggle_uas(self):
         if getattr(self, "uas_thread", None) and self.uas_thread.is_alive():
-            self.stop_event.set()
-            self.uas_thread.join(timeout=1)
-            self.uas_thread = None
+            self.on_stop_uas()
             self.uas_btn.config(text="Iniciar UAS")
         else:
             cfg = self.get_config()
             if not cfg:
                 return
             sock = self._ensure_shared_sock()
-            self.sm = SIPManager(sock=sock)
-            self._sm_for_gui = self.sm
+            sm = SIPManager(sock=sock)
+            self.sm = sm
+            self._sm_for_gui = sm
+            self.uas_stop = threading.Event()
             self.stop_event.clear()
             self.uas_thread = threading.Thread(
                 target=uas_worker,
-                args=(cfg, self.event_q, self.stop_event, self.sm),
+                args=(cfg, self.event_q, self.uas_stop, sm),
                 daemon=True,
             )
             self.uas_thread.start()
             self.uas_btn.config(text="Detener UAS")
+            self._refresh_buttons_state()
+
+    def on_stop_uas(self):
+        if getattr(self, "uas_stop", None):
+            self.uas_stop.set()
+        if getattr(self, "uas_thread", None):
+            self.uas_thread.join(timeout=1.0)
+            self.uas_thread = None
+        sm = getattr(self, "_sm_for_gui", None)
+        if sm:
+            sm.bye_all_uas()
+        try:
+            self.uas_btn.config(text="Iniciar UAS")
+        except Exception:
+            pass
+        self._refresh_buttons_state()
+        self.log("UAS service stopped")
 
     def stop_all(self):
+        sm = getattr(self, "_sm_for_gui", None)
+        if sm:
+            sm.bye_all_uac()
         self.stop_event.set()
-        self.stop_options_monitor()
+        self.stop_options_monitor(close_sock=False)
         if getattr(self, "load_thread", None):
             self.load_thread.join(timeout=1)
             self.load_thread = None
-        if getattr(self, "uas_thread", None):
-            self.uas_thread.join(timeout=1)
-            self.uas_thread = None
-            self.uas_btn.config(text="Iniciar UAS")
-        # send BYE for any pending dialogs
-        self.sm.bye_all_uac()
-        self.sm.bye_all_uas()
-        self._refresh_buttons_state()
-        self.log("Detenido todo: BYE + RTP parado.")
+        self.on_stop_uas()
+        self.after(0, self._refresh_buttons_state)
+        self.log("Detenido todo")
 
     def _ensure_shared_sock(self, bind_ip=None, src_port=None):
         """Crea (si no existe) y devuelve el socket UDP compartido bind al bind_ip/src_port."""
@@ -959,14 +975,14 @@ class App(tk.Tk):
         sm = getattr(self, "_sm_for_gui", None)
         if sm:
             sm.bye_all_uac()
-        self._refresh_buttons_state()
+        self.after(0, self._refresh_buttons_state)
         self.log("BYE UAC enviado para todos los diálogos.")
 
     def on_bye_all_uas(self):
         sm = getattr(self, "_sm_for_gui", None)
         if sm:
             sm.bye_all_uas()
-        self._refresh_buttons_state()
+        self.after(0, self._refresh_buttons_state)
         self.log("BYE UAS enviado para todos los diálogos.")
 
     def save_log(self):
@@ -1303,6 +1319,8 @@ def uas_worker(cfg, event_q, stop_event, sm):
                 data, addr = sock.recvfrom(4096)
             except socket.timeout:
                 continue
+            except OSError:
+                break
             start, headers = parse_headers(data)
             if not start:
                 continue
@@ -1369,7 +1387,7 @@ def uas_worker(cfg, event_q, stop_event, sm):
                         rtp.start(rem_ip, rem_port)
                     except Exception:
                         rtp = None
-                sm.dialogs_uas[call_id] = Dialog(
+                sm.uas_dialogs[call_id] = Dialog(
                     local_tag=local_tag,
                     remote_tag=remote_tag or "",
                     call_id=call_id,
@@ -1385,7 +1403,7 @@ def uas_worker(cfg, event_q, stop_event, sm):
                     dst=addr,
                     rtp=rtp,
                 )
-                event_q.put(("uas", {"dialogs": len(sm.dialogs_uas)}))
+                event_q.put(("uas", {"dialogs": len(sm.uas_dialogs)}))
             elif start.startswith("BYE "):
                 try:
                     via = headers["via"]
@@ -1395,12 +1413,12 @@ def uas_worker(cfg, event_q, stop_event, sm):
                     cseq_hdr = headers["cseq"]
                 except KeyError:
                     continue
-                d = sm.dialogs_uas.pop(call_id, None)
+                d = sm.uas_dialogs.pop(call_id, None)
                 to_resp = to
                 if d:
                     to_resp = f"{d.to_uri};tag={d.local_tag}"
                     sm._safe_stop_rtp(d)
-                    event_q.put(("uas", {"dialogs": len(sm.dialogs_uas)}))
+                    event_q.put(("uas", {"dialogs": len(sm.uas_dialogs)}))
                 headers200 = {
                     "Via": via,
                     "From": fr,
