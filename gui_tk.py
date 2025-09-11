@@ -24,7 +24,6 @@ from sip_manager import (
     build_ringing,
     build_200,
     build_487,
-    Dialog,
 )
 from app import run_load_generator
 
@@ -186,8 +185,20 @@ class App(tk.Tk):
         lf_mode = ttk.LabelFrame(general, text="Modo")
         lf_mode.grid(row=3, column=0, sticky="nsew", padx=8, pady=4)
         self.vars["role"] = tk.StringVar(value=cfg.get("role", "UAC"))
-        ttk.Radiobutton(lf_mode, text="UAC", variable=self.vars["role"], value="UAC", command=self.update_button_states).grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(lf_mode, text="UAS", variable=self.vars["role"], value="UAS", command=self.update_button_states).grid(row=0, column=1, sticky="w")
+        ttk.Radiobutton(
+            lf_mode,
+            text="UAC",
+            variable=self.vars["role"],
+            value="UAC",
+            command=self._refresh_buttons_state,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(
+            lf_mode,
+            text="UAS",
+            variable=self.vars["role"],
+            value="UAS",
+            command=self._refresh_buttons_state,
+        ).grid(row=0, column=1, sticky="w")
         self._add_check(lf_mode, "wait_bye", 1, cfg, text="esperar BYE")
         self._add_check(
             lf_mode,
@@ -326,6 +337,9 @@ class App(tk.Tk):
         self.log_text['yscrollcommand'] = scroll.set
         ttk.Button(status, text="Guardar log...", command=self.save_log).pack(anchor="e")
         self._refresh_buttons_state()
+        for key in ("bind_ip", "dst_host", "src_port", "dst_port", "calls", "role"):
+            if key in self.vars:
+                self.vars[key].trace_add("write", lambda *a: self._refresh_buttons_state())
 
     # helpers -----------------------------------------------------------
     def _add_entry(self, parent, key, row, cfg, show=None):
@@ -340,7 +354,7 @@ class App(tk.Tk):
     def _add_check(self, parent, key, row, cfg, text=None):
         var = tk.BooleanVar(value=cfg.get(key, False))
         chk = ttk.Checkbutton(
-            parent, text=text or key, variable=var, command=self.update_button_states
+            parent, text=text or key, variable=var, command=self._refresh_buttons_state
         )
         chk.grid(row=row, column=0, columnspan=2, sticky="w", padx=8, pady=4)
         self.vars[key] = var
@@ -535,6 +549,27 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _can_enable_generator(self):
+        # Must be in UAC mode
+        role_var = self.vars.get("role")
+        if role_var and role_var.get().lower() != "uac":
+            return False
+        # No UAC call running
+        if getattr(self, "_uac_running", False):
+            return False
+        try:
+            bind_ip = self.vars.get("bind_ip").get().strip()
+            dst_host = self.vars.get("dst_host").get().strip()
+            int(self.vars.get("src_port").get().strip())
+            int(self.vars.get("dst_port").get().strip())
+        except Exception:
+            return False
+        try:
+            calls = int(self.vars.get("calls").get().strip())
+            return calls >= 1 and bool(bind_ip) and bool(dst_host)
+        except Exception:
+            return False
+
     def _refresh_buttons_state(self):
         self.update_button_states()
         sm = getattr(self, "_sm_for_gui", None)
@@ -551,6 +586,13 @@ class App(tk.Tk):
         try:
             uas_has = sm and sm.uas_active_count() > 0
             self.bye_uas_btn.configure(state=("normal" if uas_has else "disabled"))
+        except Exception:
+            pass
+        try:
+            enable_gen = self._can_enable_generator()
+            self.load_btn.configure(state=("normal" if enable_gen else "disabled"))
+            if hasattr(self, "load_tab_btn"):
+                self.load_tab_btn.configure(state=("normal" if enable_gen else "disabled"))
         except Exception:
             pass
 
@@ -1338,7 +1380,7 @@ def uas_worker(cfg, event_q, stop_event, sm):
                 remote_tag = None
                 if "tag=" in fr.lower():
                     remote_tag = fr.split("tag=")[1].split(";", 1)[0]
-                local_tag = uuid.uuid4().hex[:8]
+                local_tag = sm._new_tag()
                 to_resp = f"{to};tag={local_tag}"
                 headers_base = {
                     "Via": via,
@@ -1389,22 +1431,16 @@ def uas_worker(cfg, event_q, stop_event, sm):
                         rtp.start(rem_ip, rem_port)
                     except Exception:
                         rtp = None
-                sm.uas_dialogs[call_id] = Dialog(
-                    local_tag=local_tag,
-                    remote_tag=remote_tag or "",
-                    call_id=call_id,
-                    from_uri=fr.split(";", 1)[0],
-                    to_uri=to.split(";", 1)[0],
-                    route_set=[],
-                    remote_target=headers.get("contact", fr.split(";", 1)[0]),
-                    sock=sock,
-                    our_next_cseq=int(cseq_hdr.split()[0]) + 1,
-                    local_ip=local_ip,
-                    local_port=sock.getsockname()[1],
-                    role="uas",
-                    dst=addr,
-                    rtp=rtp,
-                )
+                sm.uas_dialogs[call_id] = {
+                    "dst": addr,
+                    "from_uri": to.split(";", 1)[0],
+                    "from_tag": local_tag,
+                    "to_uri": fr.split(";", 1)[0],
+                    "to_tag": remote_tag or "",
+                    "call_id": call_id,
+                    "cseq_next": 1,
+                    "rtp": rtp,
+                }
                 event_q.put(("uas", {"dialogs": len(sm.uas_dialogs)}))
             elif start.startswith("BYE "):
                 try:
@@ -1416,9 +1452,12 @@ def uas_worker(cfg, event_q, stop_event, sm):
                 except KeyError:
                     continue
                 d = sm.uas_dialogs.pop(call_id, None)
+                sm.logger.info(
+                    f"RX BYE call_id={call_id} side=UAS -> sending 200 OK & stopping RTP"
+                )
                 to_resp = to
                 if d:
-                    to_resp = f"{d.to_uri};tag={d.local_tag}"
+                    to_resp = f"{d['from_uri']};tag={d['from_tag']}"
                     sm._safe_stop_rtp(d)
                     event_q.put(("uas", {"dialogs": len(sm.uas_dialogs)}))
                 headers200 = {
