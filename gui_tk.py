@@ -171,7 +171,9 @@ class App(tk.Tk):
         lf_dest = ttk.LabelFrame(general, text="Destino")
         lf_dest.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
         self._add_entry(lf_dest, "dst_host", 0, cfg)
+        self.entry_dst_host = self.widgets["dst_host"]
         self._add_entry(lf_dest, "dst_port", 1, cfg)
+        self.entry_dst_port = self.widgets["dst_port"]
 
         lf_audio = ttk.LabelFrame(general, text="Audio")
         lf_audio.grid(row=2, column=0, sticky="nsew", padx=8, pady=4)
@@ -185,6 +187,7 @@ class App(tk.Tk):
         lf_mode = ttk.LabelFrame(general, text="Modo")
         lf_mode.grid(row=3, column=0, sticky="nsew", padx=8, pady=4)
         self.vars["role"] = tk.StringVar(value=cfg.get("role", "UAC"))
+        self.role_var = self.vars["role"]
         ttk.Radiobutton(
             lf_mode,
             text="UAC",
@@ -278,6 +281,9 @@ class App(tk.Tk):
         self._add_entry(lf_auth, "auth_user", 1, cfg)
         self._add_entry(lf_auth, "auth_pass", 2, cfg, show="*")
 
+        cfg["src_port_step"] = cfg.get("src_port_step") or "10"
+        cfg["rtp_port_step"] = cfg.get("rtp_port_step") or "2"
+
         # ------------------ Load tab ------------------
         load = ttk.Frame(nb)
         nb.add(load, text="Carga")
@@ -286,15 +292,25 @@ class App(tk.Tk):
         lf_load.grid(row=0, column=0, sticky="nsew", padx=8, pady=4)
         self._add_check(lf_load, "load", 0, cfg, text="load")
         self._add_entry(lf_load, "calls", 1, cfg)
+        self.entry_calls = self.widgets["calls"]
         self._add_entry(lf_load, "rate", 2, cfg)
+        self.entry_rate = self.widgets["rate"]
         self._add_entry(lf_load, "max_active", 3, cfg)
+        self.entry_max_active = self.widgets["max_active"]
         self._add_entry(lf_load, "from_number_start", 4, cfg)
+        self.entry_from_start = self.widgets["from_number_start"]
         self._add_entry(lf_load, "to_number_start", 5, cfg)
+        self.entry_to_start = self.widgets["to_number_start"]
         self._add_entry(lf_load, "number_step", 6, cfg)
+        self.entry_number_step = self.widgets["number_step"]
         self._add_entry(lf_load, "pad_width", 7, cfg)
+        self.entry_pad_width = self.widgets["pad_width"]
         self._add_entry(lf_load, "src_port_base", 8, cfg)
+        self.entry_src_port_base = self.widgets["src_port_base"]
         self._add_entry(lf_load, "src_port_step", 9, cfg)
+        self.entry_src_port_step = self.widgets["src_port_step"]
         self._add_entry(lf_load, "rtp_port_step", 10, cfg)
+        self.entry_rtp_port_step = self.widgets["rtp_port_step"]
         self._add_check(lf_load, "ignore_health", 11, cfg, text="ignorar health")
         self.load_tab_btn = ttk.Button(load, text="Iniciar Generador", command=self.start_load)
         self.load_tab_btn.grid(row=1, column=0, pady=8)
@@ -340,6 +356,16 @@ class App(tk.Tk):
         for key in ("bind_ip", "dst_host", "src_port", "dst_port", "calls", "role"):
             if key in self.vars:
                 self.vars[key].trace_add("write", lambda *a: self._refresh_buttons_state())
+        for w in [
+            self.entry_calls,
+            self.entry_dst_host,
+            self.entry_dst_port,
+            self.entry_src_port_base,
+            self.entry_src_port_step,
+            self.entry_rtp_port_step,
+        ]:
+            w.bind("<KeyRelease>", lambda e: self._refresh_buttons_state())
+            w.bind("<FocusOut>", lambda e: self._refresh_buttons_state())
 
     # helpers -----------------------------------------------------------
     def _add_entry(self, parent, key, row, cfg, show=None):
@@ -358,6 +384,20 @@ class App(tk.Tk):
         )
         chk.grid(row=row, column=0, columnspan=2, sticky="w", padx=8, pady=4)
         self.vars[key] = var
+
+    def _int_or(self, s, default):
+        try:
+            s = (s or "").strip()
+            return int(s) if s != "" else default
+        except Exception:
+            return default
+
+    def _float_or(self, s, default):
+        try:
+            s = (s or "").strip()
+            return float(s) if s != "" else default
+        except Exception:
+            return default
 
     def log(self, msg: str):
         self.event_q.put(("log", msg))
@@ -550,23 +590,25 @@ class App(tk.Tk):
             pass
 
     def _can_enable_generator(self):
-        # Must be in UAC mode
-        role_var = self.vars.get("role")
-        if role_var and role_var.get().lower() != "uac":
+        if self.role_var.get().lower() != "uac":
             return False
-        # No UAC call running
         if getattr(self, "_uac_running", False):
             return False
         try:
-            bind_ip = self.vars.get("bind_ip").get().strip()
-            dst_host = self.vars.get("dst_host").get().strip()
-            int(self.vars.get("src_port").get().strip())
-            int(self.vars.get("dst_port").get().strip())
-        except Exception:
-            return False
-        try:
-            calls = int(self.vars.get("calls").get().strip())
-            return calls >= 1 and bool(bind_ip) and bool(dst_host)
+            calls = self._int_or(self.entry_calls.get(), 1)
+            dst_host = self.entry_dst_host.get().strip()
+            dst_port = self._int_or(self.entry_dst_port.get(), 5060)
+            src_port_base = self._int_or(self.entry_src_port_base.get(), 5062)
+            src_port_step = self._int_or(self.entry_src_port_step.get(), 10)
+            rtp_port_step = self._int_or(self.entry_rtp_port_step.get(), 2)
+            return (
+                calls >= 1
+                and bool(dst_host)
+                and dst_port > 0
+                and src_port_base > 0
+                and src_port_step > 0
+                and rtp_port_step > 0
+            )
         except Exception:
             return False
 
@@ -634,6 +676,22 @@ class App(tk.Tk):
         except ValueError as exc:
             messagebox.showerror("Valor inválido", str(exc))
             return None
+        return cfg
+
+    def _get_load_cfg(self):
+        cfg = self.get_config()
+        if not cfg:
+            return None
+        cfg["calls"] = self._int_or(self.entry_calls.get(), 1)
+        cfg["rate"] = self._float_or(self.entry_rate.get(), 1.0)
+        cfg["max_active"] = self._int_or(self.entry_max_active.get(), cfg["calls"])
+        cfg["from_number_start"] = (self.entry_from_start.get() or "1001").strip()
+        cfg["to_number_start"] = (self.entry_to_start.get() or "2001").strip()
+        cfg["number_step"] = self._int_or(self.entry_number_step.get(), 1)
+        cfg["pad_width"] = self._int_or(self.entry_pad_width.get(), 0)
+        cfg["src_port_base"] = self._int_or(self.entry_src_port_base.get(), 5062)
+        cfg["src_port_step"] = self._int_or(self.entry_src_port_step.get(), 10)
+        cfg["rtp_port_step"] = self._int_or(self.entry_rtp_port_step.get(), 2)
         return cfg
 
     def start_options_monitor(self):
@@ -912,12 +970,13 @@ class App(tk.Tk):
         t.start()
 
     def start_load(self):
-        if self.health_state != "OK" and not self.vars["ignore_health"].get():
-            messagebox.showwarning(
-                "Health", "OPTIONS fallido: no se puede iniciar generador"
+        uas_active = getattr(self, "uas_thread", None) and self.uas_thread.is_alive()
+        if (self.health_state != "OK" or not uas_active) and not self.vars["ignore_health"].get():
+            self.log(
+                "Generador: UAS no activo o sin health; marca 'ignorar health' o arranca UAS."
             )
             return
-        cfg = self.get_config()
+        cfg = self._get_load_cfg()
         if not cfg:
             return
         sock = self._ensure_shared_sock()
@@ -927,6 +986,7 @@ class App(tk.Tk):
         t.daemon = True
         t.start()
         self.load_thread = t
+        self._refresh_buttons_state()
 
     def toggle_uas(self):
         if getattr(self, "uas_thread", None) and self.uas_thread.is_alive():
@@ -1290,44 +1350,63 @@ def call_worker(cfg, event_q, sm):
 
 
 def load_worker(cfg, event_q, stop_event, sm):
-    args = SimpleNamespace(
-        dst=cfg.get("dst_host"),
-        dst_port=int(cfg.get("dst_port", 5060)),
-        host=None,
-        port=None,
-        to_uri_pattern=None,
-        to_number_start=cfg.get("to_number_start") or "1000",
-        from_number_start=cfg.get("from_number") or "1000",
-        number_step=int(cfg.get("number_step", "1")),
-        pad_width=int(cfg.get("pad_width", "0")),
-        from_number=None,
-        from_user="dimitri",
-        to_domain_load=cfg.get("to_domain") or cfg.get("dst_host"),
-        from_domain_load=cfg.get("from_domain") or (cfg.get("bind_ip") or ""),
-        src_port_base=int(cfg.get("src_port_base", "0")),
-        src_port_step=int(cfg.get("src_port_step", "10")),
-        rtp_port_base=int(cfg.get("rtp_port_base", "40000")),
-        rtp_port_step=int(cfg.get("rtp_port_step", "2")),
-        bind_ip=cfg.get("bind_ip") or None,
-        timeout=2.0,
-        ring_timeout=15.0,
-        talk_time=0.0,
-        wait_bye=False,
-        max_call_time=0.0,
-        codecs=[(0, "PCMU")],
-        rtcp=False,
-        rtp_tone=None,
-        rtp_send_silence=False,
-        symmetric_rtp=False,
-        rtp_stats_every=float(cfg.get("rtp_stats_every", "2.0")),
-        calls=int(cfg.get("calls", "1")),
-        rate=float(cfg.get("rate", "1.0")),
-        max_active=int(cfg.get("max_active", "1")),
-    )
+    try:
+        args = SimpleNamespace(
+            dst=cfg.get("dst_host"),
+            dst_port=cfg.get("dst_port", 5060),
+            host=None,
+            port=None,
+            to_uri_pattern=None,
+            to_number_start=cfg.get("to_number_start") or "2001",
+            from_number_start=cfg.get("from_number_start") or "1001",
+            number_step=cfg.get("number_step", 1),
+            pad_width=cfg.get("pad_width", 0),
+            from_number=None,
+            from_user="dimitri",
+            to_domain_load=cfg.get("to_domain") or cfg.get("dst_host"),
+            from_domain_load=cfg.get("from_domain") or (cfg.get("bind_ip") or ""),
+            src_port_base=cfg.get("src_port_base", 0),
+            src_port_step=cfg.get("src_port_step", 10),
+            rtp_port_base=cfg.get("rtp_port_base", 40000),
+            rtp_port_step=cfg.get("rtp_port_step", 2),
+            bind_ip=cfg.get("bind_ip") or None,
+            timeout=2.0,
+            ring_timeout=15.0,
+            talk_time=0.0,
+            wait_bye=False,
+            max_call_time=0.0,
+            codecs=[(0, "PCMU")],
+            rtcp=False,
+            rtp_tone=None,
+            rtp_send_silence=False,
+            symmetric_rtp=False,
+            rtp_stats_every=cfg.get("rtp_stats_every", 2.0),
+            calls=cfg.get("calls", 1),
+            rate=cfg.get("rate", 1.0),
+            max_active=cfg.get("max_active", 1),
+        )
+        if (
+            args.calls < 1
+            or not args.dst
+            or args.dst_port <= 0
+            or args.src_port_base <= 0
+            or args.src_port_step <= 0
+            or args.rtp_port_step <= 0
+        ):
+            event_q.put(("log", "Generador: parámetros inválidos; abortando"))
+            return
+    except Exception as exc:  # noqa: BLE001
+        event_q.put(("log", f"Generador: parámetros inválidos ({exc})"))
+        return
+
     def stats_cb(snapshot):
         event_q.put(("uac", snapshot))
 
-    run_load_generator(args, sm, stats_cb=stats_cb)
+    try:
+        run_load_generator(args, sm, stats_cb=stats_cb)
+    except Exception as exc:  # noqa: BLE001
+        event_q.put(("log", f"Generador: abortado ({exc})"))
+        return
     event_q.put(("log", "Load finished"))
 
 
