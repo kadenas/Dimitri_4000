@@ -398,6 +398,8 @@ class Dialog:
     local_ip: str
     local_port: int
     role: str
+    dst: tuple[str, int] | None = None
+    rtp: RtpSession | None = None
 
 
 def parse_headers(data: bytes):
@@ -1058,6 +1060,8 @@ class SIPManager:
                         local_ip=local_ip,
                         local_port=local_port,
                         role="uac",
+                        dst=(dst_host, dst_port),
+                        rtp=rtp,
                     )
                     talk_start = time.monotonic()
                     if wait_bye:
@@ -1188,6 +1192,16 @@ class SIPManager:
         return call_id, result, setup_ms or 0, talk_s
 
     # ------------------------------------------------------------------
+    def _safe_stop_rtp(self, d):
+        """Stop RTP session stored in dialog if present, ignoring errors."""
+        try:
+            rtp = getattr(d, "rtp", None)
+            if rtp:
+                rtp.stop()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     def bye_all(self, role: str, timeout: float = 3.0) -> int:
         """Send BYE to all active dialogs for the given role.
 
@@ -1225,7 +1239,10 @@ class SIPManager:
             lines.append("Content-Length: 0\r\n\r\n")
             msg = "".join(lines).encode()
             try:
-                d.sock.send(msg)
+                if getattr(d, "dst", None):
+                    d.sock.sendto(msg, d.dst)
+                else:
+                    d.sock.send(msg)
                 d.sock.settimeout(timeout)
                 try:
                     while True:
@@ -1238,6 +1255,7 @@ class SIPManager:
             except OSError:
                 pass
             finally:
+                self._safe_stop_rtp(d)
                 dialogs.pop(key, None)
                 count += 1
         return count
@@ -1253,6 +1271,10 @@ class SIPManager:
     def uac_active_count(self) -> int:
         """Return number of active UAC dialogs."""
         return len(self.dialogs_uac)
+
+    def uas_active_count(self) -> int:
+        """Return number of active UAS dialogs."""
+        return len(self.dialogs_uas)
 
     def active_counts(self) -> dict:
         """Return a dictionary with active dialog counts."""

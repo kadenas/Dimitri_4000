@@ -537,17 +537,20 @@ class App(tk.Tk):
 
     def _refresh_buttons_state(self):
         self.update_button_states()
-        if getattr(self, "_uac_running", False):
-            try:
-                self.call_btn.configure(state="disabled")
-            except Exception:
-                pass
         sm = getattr(self, "_sm_for_gui", None)
+        running = bool(getattr(self, "_uac_running", False))
         try:
-            if sm and sm.uac_active_count() > 0:
-                self.bye_uac_btn.configure(state="normal")
-            else:
-                self.bye_uac_btn.configure(state="disabled")
+            self.call_btn.configure(state=("disabled" if running else "normal"))
+        except Exception:
+            pass
+        try:
+            uac_has = sm and sm.uac_active_count() > 0
+            self.bye_uac_btn.configure(state=("normal" if uac_has else "disabled"))
+        except Exception:
+            pass
+        try:
+            uas_has = sm and sm.uas_active_count() > 0
+            self.bye_uas_btn.configure(state=("normal" if uas_has else "disabled"))
         except Exception:
             pass
 
@@ -914,9 +917,10 @@ class App(tk.Tk):
             self.uas_thread = None
             self.uas_btn.config(text="Iniciar UAS")
         # send BYE for any pending dialogs
-        self.sm.bye_all("uac")
-        self.sm.bye_all("uas")
+        self.sm.bye_all_uac()
+        self.sm.bye_all_uas()
         self._refresh_buttons_state()
+        self.log("Detenido todo: BYE + RTP parado.")
 
     def _ensure_shared_sock(self, bind_ip=None, src_port=None):
         """Crea (si no existe) y devuelve el socket UDP compartido bind al bind_ip/src_port."""
@@ -956,12 +960,14 @@ class App(tk.Tk):
         if sm:
             sm.bye_all_uac()
         self._refresh_buttons_state()
+        self.log("BYE UAC enviado para todos los diálogos.")
 
     def on_bye_all_uas(self):
         sm = getattr(self, "_sm_for_gui", None)
         if sm:
             sm.bye_all_uas()
         self._refresh_buttons_state()
+        self.log("BYE UAS enviado para todos los diálogos.")
 
     def save_log(self):
         path = filedialog.asksaveasfilename(defaultextension=".log")
@@ -1290,7 +1296,6 @@ def uas_worker(cfg, event_q, stop_event, sm):
         stats_every = float(cfg.get("rtp_stats_every", "2.0") or 2.0)
     except Exception:
         stats_every = 2.0
-    dialogs = {}
     event_q.put(("log", "UAS service started"))
     try:
         while not stop_event.is_set():
@@ -1364,7 +1369,6 @@ def uas_worker(cfg, event_q, stop_event, sm):
                         rtp.start(rem_ip, rem_port)
                     except Exception:
                         rtp = None
-                dialogs[call_id] = {"local_tag": local_tag, "to_uri": to.split(";", 1)[0], "rtp": rtp}
                 sm.dialogs_uas[call_id] = Dialog(
                     local_tag=local_tag,
                     remote_tag=remote_tag or "",
@@ -1378,6 +1382,8 @@ def uas_worker(cfg, event_q, stop_event, sm):
                     local_ip=local_ip,
                     local_port=sock.getsockname()[1],
                     role="uas",
+                    dst=addr,
+                    rtp=rtp,
                 )
                 event_q.put(("uas", {"dialogs": len(sm.dialogs_uas)}))
             elif start.startswith("BYE "):
@@ -1389,17 +1395,11 @@ def uas_worker(cfg, event_q, stop_event, sm):
                     cseq_hdr = headers["cseq"]
                 except KeyError:
                     continue
-                info = dialogs.pop(call_id, None)
-                sm.dialogs_uas.pop(call_id, None)
+                d = sm.dialogs_uas.pop(call_id, None)
                 to_resp = to
-                if info:
-                    to_resp = f"{info['to_uri']};tag={info['local_tag']}"
-                    try:
-                        rtp = info.get("rtp")
-                        if rtp:
-                            rtp.stop()
-                    except Exception:
-                        pass
+                if d:
+                    to_resp = f"{d.to_uri};tag={d.local_tag}"
+                    sm._safe_stop_rtp(d)
                     event_q.put(("uas", {"dialogs": len(sm.dialogs_uas)}))
                 headers200 = {
                     "Via": via,
