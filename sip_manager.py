@@ -7,6 +7,7 @@ import hashlib
 import secrets
 import errno
 import random
+import string
 from dataclasses import dataclass
 from typing import Dict, Tuple
 from rtp import RtpSession
@@ -270,6 +271,35 @@ def build_bye_request(
     return msg.encode()
 
 
+def build_bye_in_dialog(
+    from_uri: str,
+    from_tag: str,
+    to_uri: str,
+    to_tag: str,
+    call_id: str,
+    cseq: int,
+    src_host: str,
+    src_port: int,
+    branch: str | None = None,
+):
+    """Build a BYE within an existing dialog for the UAS side."""
+    if branch is None:
+        branch = "z9hG4bK" + uuid.uuid4().hex[:16]
+    msg = (
+        f"BYE {to_uri} SIP/2.0\r\n"
+        f"Via: SIP/2.0/UDP {src_host}:{src_port};branch={branch};rport\r\n"
+        "Max-Forwards: 70\r\n"
+        f"From: <{from_uri}>;tag={from_tag}\r\n"
+        f"To: <{to_uri}>;tag={to_tag}\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: {cseq} BYE\r\n"
+        f"Contact: <sip:{from_uri.split(':',1)[1]}>\r\n"
+        "User-Agent: Dimitri-4000/0.1\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    return msg.encode()
+
+
 def _contact_uri_host_port(contact: str) -> Tuple[str, str, int | None]:
     """Return (uri, host, port) extracted from a Contact header.
 
@@ -451,6 +481,10 @@ class SIPManager:
     def _new_cseq(self) -> int:
         """Return a random initial CSeq for new dialogs."""
         return random.randint(100, 10000)
+
+    def _new_tag(self) -> str:
+        """Return a simple random tag for dialog identifiers."""
+        return ''.join(random.choice(string.hexdigits.lower()) for _ in range(8))
 
     def _local_ip_port(
         self,
@@ -1104,6 +1138,11 @@ class SIPManager:
                                         },
                                     )
                                     s.send(resp)
+                                    self.logger.info(
+                                        f"RX BYE call_id={call_id} side=UAC -> sending 200 OK & stopping RTP"
+                                    )
+                                    self._safe_stop_rtp(self.uac_dialogs.get(call_id))
+                                    self.uac_dialogs.pop(call_id, None)
                                     result = "remote-bye"
                                     break
                                 c2, _ = status_from_response(data2)
@@ -1197,7 +1236,10 @@ class SIPManager:
     def _safe_stop_rtp(self, d):
         """Stop RTP session stored in dialog if present, ignoring errors."""
         try:
-            rtp = getattr(d, "rtp", None)
+            if isinstance(d, dict):
+                rtp = d.get("rtp")
+            else:
+                rtp = getattr(d, "rtp", None)
             if rtp:
                 rtp.stop()
         except Exception:
@@ -1221,7 +1263,37 @@ class SIPManager:
         """
 
         role = role.lower()
-        dialogs = self.uac_dialogs if role == "uac" else self.uas_dialogs
+        if role == "uas":
+            count = 0
+            for call_id, d in list(self.uas_dialogs.items()):
+                try:
+                    src_ip, src_port = self._local_ip_port(self.sock, d["dst"][0], d["dst"][1])
+                    cseq = d.get("cseq_next", 1)
+                    d["cseq_next"] = cseq + 1
+                    bye = build_bye_in_dialog(
+                        from_uri=d["from_uri"],
+                        from_tag=d["from_tag"],
+                        to_uri=d["to_uri"],
+                        to_tag=d["to_tag"],
+                        call_id=d["call_id"],
+                        cseq=cseq,
+                        src_host=src_ip,
+                        src_port=src_port,
+                    )
+                    self.logger.info(
+                        f"UAS BYE -> {d['dst']} call_id={call_id} cseq={cseq}"
+                    )
+                    self.sock.sendto(bye, d["dst"])
+                except Exception as e:
+                    self.logger.error(f"UAS BYE error call_id={call_id}: {e}")
+                finally:
+                    self._safe_stop_rtp(d)
+                    self.uas_dialogs.pop(call_id, None)
+                    count += 1
+            return count
+
+        # Default to UAC handling
+        dialogs = self.uac_dialogs
         count = 0
         for key, d in list(dialogs.items()):
             branch = "z9hG4bK" + uuid.uuid4().hex
@@ -1244,7 +1316,7 @@ class SIPManager:
             dst = getattr(d, "dst", None)
             try:
                 self.logger.info(
-                    f"{role.upper()} BYE -> {dst or d.remote_target} call_id={d.call_id} cseq={cseq}"
+                    f"UAC BYE -> {dst or d.remote_target} call_id={d.call_id} cseq={cseq}"
                 )
                 if dst:
                     d.sock.sendto(msg, dst)
@@ -1260,9 +1332,7 @@ class SIPManager:
                 except socket.timeout:
                     pass
             except OSError as e:
-                self.logger.error(
-                    f"{role.upper()} BYE error call_id={d.call_id}: {e}"
-                )
+                self.logger.error(f"UAC BYE error call_id={d.call_id}: {e}")
             finally:
                 self._safe_stop_rtp(d)
                 dialogs.pop(key, None)
