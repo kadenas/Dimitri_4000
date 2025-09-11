@@ -6,6 +6,7 @@ import uuid
 import hashlib
 import secrets
 import errno
+import random
 from dataclasses import dataclass
 from typing import Dict, Tuple
 from rtp import RtpSession
@@ -441,14 +442,15 @@ class SIPManager:
         self.sock = sock
         self.sock.settimeout(2.0)
         # dialogs indexed by Call-ID for UAC and UAS roles
-        self.dialogs_uac: Dict[str, Dialog] = {}
-        self.dialogs_uas: Dict[str, Dialog] = {}
-        # expose dictionaries with generic names for GUI helpers
-        self.uac_dialogs = self.dialogs_uac
-        self.uas_dialogs = self.dialogs_uas
+        self.uac_dialogs: Dict[str, Dialog] = {}
+        self.uas_dialogs: Dict[str, Dialog] = {}
         self.cseq_invite = 1
         self.cseq_bye = 1
         self.cseq_options = 1
+
+    def _new_cseq(self) -> int:
+        """Return a random initial CSeq for new dialogs."""
+        return random.randint(100, 10000)
 
     def _local_ip_port(
         self,
@@ -618,7 +620,7 @@ class SIPManager:
             request_uri = make_uri(to_user, dst_host)
 
         contact_user = from_user
-        invite_cseq = cseq_start
+        invite_cseq = self._new_cseq()
         auth_username = auth_username or auth_user or from_user
         auth_state = {"nc": 0, "realm": auth_realm, "nonce": None, "opaque": None, "qop": "auth", "proxy": False}
 
@@ -1047,7 +1049,7 @@ class SIPManager:
                     remote_tag = ""
                     if "tag=" in to_header:
                         remote_tag = to_header.split("tag=")[1].split(";", 1)[0]
-                    self.dialogs_uac[call_id] = Dialog(
+                    self.uac_dialogs[call_id] = Dialog(
                         local_tag=tag,
                         remote_tag=remote_tag,
                         call_id=call_id,
@@ -1172,7 +1174,7 @@ class SIPManager:
                     pass
             result = "aborted"
         finally:
-            self.dialogs_uac.pop(call_id, None)
+            self.uac_dialogs.pop(call_id, None)
             if owned_socket:
                 s.close()
             else:
@@ -1219,7 +1221,7 @@ class SIPManager:
         """
 
         role = role.lower()
-        dialogs = self.dialogs_uac if role == "uac" else self.dialogs_uas
+        dialogs = self.uac_dialogs if role == "uac" else self.uas_dialogs
         count = 0
         for key, d in list(dialogs.items()):
             branch = "z9hG4bK" + uuid.uuid4().hex
@@ -1270,12 +1272,12 @@ class SIPManager:
 
     def uac_active_count(self) -> int:
         """Return number of active UAC dialogs."""
-        return len(self.dialogs_uac)
+        return len(self.uac_dialogs)
 
     def uas_active_count(self) -> int:
         """Return number of active UAS dialogs."""
-        return len(self.dialogs_uas)
+        return len(self.uas_dialogs)
 
     def active_counts(self) -> dict:
         """Return a dictionary with active dialog counts."""
-        return {"uac": len(self.dialogs_uac), "uas": len(self.dialogs_uas)}
+        return {"uac": len(self.uac_dialogs), "uas": len(self.uas_dialogs)}
