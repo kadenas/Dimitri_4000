@@ -1398,13 +1398,14 @@ def load_worker(cfg, event_q, stop_event, sm):
             codecs=[(0, "PCMU")],
             rtcp=False,
             rtp_tone=None,
-            rtp_send_silence=False,
+            rtp_send_silence=bool(cfg.get("send_silence", False)),
             symmetric_rtp=False,
             rtp_stats_every=cfg.get("rtp_stats_every", 2.0),
             calls=cfg.get("calls", 1),
             rate=cfg.get("rate", 1.0),
             max_active=cfg.get("max_active", 1),
         )
+        args.rtp_always_silence = args.rtp_send_silence
         if (
             args.calls < 1
             or not args.dst
