@@ -131,6 +131,7 @@ def build_invite(
     pai: str | None = None,
     use_pai: bool = False,
     use_pai_asserted: bool = False,
+    extra_headers: str = "",
     auth_header: tuple[str, str] | None = None,
 ) -> bytes:
     sent_by = f"{local_ip}:{local_port}"
@@ -148,7 +149,6 @@ def build_invite(
         f"CSeq: {cseq} INVITE\r\n"
         f"Contact: <sip:{contact_user}@{local_ip}:{local_port}>\r\n"
         "User-Agent: Dimitri-4000/0.1\r\n"
-        "Allow: INVITE, ACK, CANCEL, BYE, OPTIONS\r\n"
     )
     if use_pai and pai:
         msg += f"P-Preferred-Identity: <{pai}>\r\n"
@@ -156,7 +156,10 @@ def build_invite(
         msg += f"P-Asserted-Identity: <{pai}>\r\n"
     if auth_header:
         msg += f"{auth_header[0]}: {auth_header[1]}\r\n"
+    if extra_headers:
+        msg += extra_headers
     msg += (
+        "Allow: INVITE, ACK, CANCEL, BYE, OPTIONS\r\n"
         "Content-Type: application/sdp\r\n"
         f"Content-Length: {content_length}\r\n\r\n"
         f"{sdp}"
@@ -604,6 +607,7 @@ class SIPManager:
         symmetric: bool = False,
         save_wav: str | None = None,
         stats_interval: float = 2.0,
+        extra_headers: str = "",
     ) -> tuple[str, str, int, float]:
         if self.protocol != "udp":
             raise NotImplementedError("Solo UDP por ahora.")
@@ -670,6 +674,7 @@ class SIPManager:
             sdp_bytes = build_sdp_offer(local_ip, rtp_port, codecs)
         logger.info("Offer SDP PTs=%s; supported locally=[0,8]", pt_list)
         sdp_str = sdp_bytes.decode()
+        self.logger.info("Extra headers: %r", extra_headers.replace("\r\n", " | "))
         invite = build_invite(
             request_uri,
             from_uri,
@@ -686,6 +691,7 @@ class SIPManager:
             pai=pai,
             use_pai=use_pai,
             use_pai_asserted=use_pai_asserted,
+            extra_headers=extra_headers,
         )
 
         logger.info(
@@ -995,6 +1001,7 @@ class SIPManager:
                             use_pai=use_pai,
                             use_pai_asserted=use_pai_asserted,
                             auth_header=(hdr_name, auth_val),
+                            extra_headers=extra_headers,
                         )
                         logger.info("Reenviando INVITE con autenticacion Digest")
                         try:
