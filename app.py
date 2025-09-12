@@ -80,6 +80,10 @@ def write_csv_row(path, row, header=None):
         w.writerow(row)
 
 
+def _get_flag(obj, name):
+    return bool(getattr(obj, name, False))
+
+
 def send_options_periodic(
     bind_ip: str | None,
     src_port: int,
@@ -438,7 +442,10 @@ def run_load_generator(args, sip_manager, stats_cb=None):
                     rtp_port_forced=True,
                     rtcp=args.rtcp,
                     tone_hz=args.rtp_tone,
-                    send_silence=(args.rtp_send_silence or args.rtp_always_silence),
+                    send_silence=(
+                        _get_flag(args, "rtp_send_silence")
+                        or _get_flag(args, "rtp_always_silence")
+                    ),
                     symmetric=args.symmetric_rtp,
                     stats_interval=args.rtp_stats_every,
                 )
@@ -655,7 +662,10 @@ def main():
                 rtp_port_forced=args.rtp_port_forced,
                 rtcp=args.rtcp,
                 tone_hz=args.rtp_tone,
-                send_silence=(args.rtp_send_silence or args.rtp_always_silence),
+                send_silence=(
+                    _get_flag(args, "rtp_send_silence")
+                    or _get_flag(args, "rtp_always_silence")
+                ),
                 symmetric=args.symmetric_rtp,
                 save_wav=args.rtp_save_wav,
                 stats_interval=args.rtp_stats_every,
@@ -1009,7 +1019,10 @@ def main():
                                         rtp.rtcp = args.rtcp
                                         rtp.tone_hz = args.rtp_tone
                                         rtp.send_silence = (
-                                            (args.rtp_send_silence or args.rtp_always_silence)
+                                            (
+                                                _get_flag(args, "rtp_send_silence")
+                                                or _get_flag(args, "rtp_always_silence")
+                                            )
                                             and not args.rtp_tone
                                         )
                                         rtp.stats_interval = args.rtp_stats_every
