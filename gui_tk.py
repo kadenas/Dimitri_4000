@@ -25,7 +25,7 @@ from sip_manager import (
     build_200,
     build_487,
 )
-from app import run_load_generator
+from app import run_load_generator, sanitize_extra_headers
 
 # Configuration persisted in user home directory
 CONFIG_PATH = os.path.expanduser("~/.dimitri4000.json")
@@ -56,6 +56,7 @@ DEFAULT_CONFIG = {
     "to_uri": "",
     "auth_user": "",
     "auth_pass": "",
+    "extra_headers": "",
     "use_auth": False,
     "wait_bye": True,
     "require_health_call": True,
@@ -280,6 +281,12 @@ class App(tk.Tk):
         self._add_check(lf_auth, "use_auth", 0, cfg, text="usar auth")
         self._add_entry(lf_auth, "auth_user", 1, cfg)
         self._add_entry(lf_auth, "auth_pass", 2, cfg, show="*")
+
+        lf_extra = ttk.LabelFrame(identity, text="Cabeceras extra (solo INVITE)")
+        lf_extra.grid(row=2, column=0, sticky="nsew", padx=8, pady=4)
+        self.txt_extra_headers = tk.Text(lf_extra, height=6)
+        self.txt_extra_headers.pack(fill="both", expand=True)
+        self.txt_extra_headers.insert("1.0", cfg.get("extra_headers", ""))
 
         cfg["src_port_step"] = cfg.get("src_port_step") or "10"
         cfg["rtp_port_step"] = cfg.get("rtp_port_step") or "2"
@@ -676,6 +683,7 @@ class App(tk.Tk):
         except ValueError as exc:
             messagebox.showerror("Valor inválido", str(exc))
             return None
+        cfg["extra_headers"] = self.txt_extra_headers.get("1.0", "end").strip()
         return cfg
 
     def _get_load_cfg(self):
@@ -905,6 +913,9 @@ class App(tk.Tk):
         ring_timeout = float(self.vars["ring_timeout"].get()) if "ring_timeout" in self.vars else 10.0
         wait_bye = bool(self.vars.get("wait_bye").get())
 
+        raw = self.txt_extra_headers.get("1.0", "end")
+        extra_headers = sanitize_extra_headers(raw)
+
         sock = self._ensure_shared_sock()
         local_ip, _ = sock.getsockname()
         if local_ip == "0.0.0.0":
@@ -948,6 +959,7 @@ class App(tk.Tk):
                 stats_interval=stats_every,
                 ring_timeout=ring_timeout,
                 wait_bye=wait_bye,
+                extra_headers=extra_headers,
             )
             self.log(
                 f"UAC: call_id={call_id} result={result} setup={setup_ms}ms talk={talk_s}s"
@@ -1319,6 +1331,7 @@ def call_worker(cfg, event_q, sm):
     if not codecs:
         codecs = [(0, "PCMU"), (8, "PCMA")]
     tone = int(cfg.get("tone_hz", "0") or 0)
+    extra_headers = sanitize_extra_headers(cfg.get("extra_headers", ""))
     try:
         _, result, _, _ = sm.place_call(
             dst_host=dst,
@@ -1336,6 +1349,7 @@ def call_worker(cfg, event_q, sm):
             symmetric=cfg.get("symmetric_rtp", False),
             stats_interval=float(cfg.get("rtp_stats_every", "2.0")),
             wait_bye=cfg.get("wait_bye", True),
+            extra_headers=extra_headers,
         )
     except Exception as exc:  # noqa: BLE001
         event_q.put(("log", f"Call error: {exc}"))

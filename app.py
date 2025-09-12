@@ -40,6 +40,36 @@ from rtp import RtpSession
 from core.reactor import Reactor
 from core.options_monitor import OptionsMonitor, register_options_responder
 
+PROHIBITED = {
+    "via",
+    "from",
+    "to",
+    "call-id",
+    "cseq",
+    "contact",
+    "max-forwards",
+    "content-length",
+    "content-type",
+    "v",
+    "f",
+    "t",
+}
+
+
+def sanitize_extra_headers(raw: str) -> str:
+    lines: list[str] = []
+    for ln in (raw or "").replace("\r", "").split("\n"):
+        ln = ln.strip()
+        if not ln or ":" not in ln:
+            continue
+        name = ln.split(":", 1)[0].strip().lower()
+        if name in PROHIBITED:
+            continue
+        lines.append(ln)
+    if not lines:
+        return ""
+    return "".join(f"{x}\r\n" for x in lines)
+
 
 def write_csv_row(path, row, header=None):
     new_file = not os.path.exists(path)
@@ -226,6 +256,16 @@ def parse_args():
         "--auth-username",
         help="Username para Digest si distinto del número de usuario",
     )
+    p.add_argument(
+        "--extra-header",
+        action="append",
+        default=[],
+        help="Cabecera SIP extra para INVITE. Repetible.",
+    )
+    p.add_argument(
+        "--extra-headers-file",
+        help="Fichero con cabeceras extra (una por línea).",
+    )
     # Load generator options
     p.add_argument("--load", action="store_true", help="Activa generador de llamadas")
     p.add_argument("--calls", type=int, default=1, help="Cuántas llamadas lanzar en total")
@@ -294,6 +334,14 @@ def parse_args():
         if args.prefer not in codec_names:
             logger.warning("--prefer %s ignorado; no está en --codecs", args.prefer)
             args.prefer = None
+
+    extra_raw = ""
+    if args.extra_headers_file:
+        with open(args.extra_headers_file, "r", encoding="utf-8") as f:
+            extra_raw += f.read() + "\n"
+    for h in (args.extra_header or []):
+        extra_raw += h + "\n"
+    args.extra_headers = sanitize_extra_headers(extra_raw)
 
     # defaults for load generator
     if args.max_active is None:
@@ -611,6 +659,7 @@ def main():
                 symmetric=args.symmetric_rtp,
                 save_wav=args.rtp_save_wav,
                 stats_interval=args.rtp_stats_every,
+                extra_headers=args.extra_headers,
             )
         except KeyboardInterrupt:
             raise SystemExit(130)
