@@ -84,6 +84,31 @@ def _get_flag(obj, name):
     return bool(getattr(obj, name, False))
 
 
+def _norm_sip_uri(user: str | None, domain: str | None, uri: str | None) -> str | None:
+    """
+    Devuelve una URI sip canónica:
+      - si viene `uri`, lo normaliza (añade 'sip:' si falta).
+      - si no, intenta con user/domain (user puede ser from_user o from_number).
+      - si no hay datos suficientes, devuelve None.
+    """
+    if uri:
+        u = uri.strip()
+        if not u:
+            return None
+        return u if u.lower().startswith("sip:") else f"sip:{u}"
+    if user and domain:
+        return f"sip:{user}@{domain}"
+    return None
+
+
+def _require(value, label, logger=None):
+    if value is None or (isinstance(value, str) and not value.strip()):
+        if logger:
+            logger.error(f"LOAD: falta {label}; abortando esta llamada")
+        raise ValueError(f"missing {label}")
+    return value
+
+
 def send_options_periodic(
     bind_ip: str | None,
     src_port: int,
@@ -414,22 +439,39 @@ def run_load_generator(args, sip_manager, stats_cb=None):
             num_from = format_num(from_start + i * args.number_step)
         else:
             num_from = args.from_number or args.from_user
+        from_user = num_from
+        from_domain = args.from_domain_load
+        to_user = to_number
+        to_domain = args.to_domain_load
+
+        from_uri = _norm_sip_uri(from_user, from_domain, getattr(args, "from_uri", None))
+        final_to_uri = _norm_sip_uri(to_user, to_domain, to_uri)
+        try:
+            from_uri = _require(from_uri, "from_uri", logger)
+            final_to_uri = _require(final_to_uri, "to_uri", logger)
+        except ValueError:
+            with lock:
+                counters["aborted"] += 1
+                active.discard(threading.current_thread())
+            return
+
         src_port = args.src_port_base + i * args.src_port_step if args.src_port_base else 0
         rtp_port = args.rtp_port_base + i * args.rtp_port_step
         if rtp_port % 2:
             rtp_port += 1
         ts = datetime.now(UTC).isoformat()
         attempts = 0
+        send_silence = bool(
+            getattr(args, "rtp_send_silence", False)
+            or getattr(args, "rtp_always_silence", False)
+        )
         while True:
             try:
                 call_id, result, setup_ms, _ = sip_manager.place_call(
                     dst_host=dst,
                     dst_port=dport,
-                    from_number=num_from,
-                    from_domain=args.from_domain_load,
-                    to_number=to_number,
-                    to_domain=args.to_domain_load,
-                    to_uri=to_uri,
+                    from_uri=from_uri,
+                    to_uri=final_to_uri,
                     bind_ip=args.bind_ip,
                     bind_port=src_port,
                     timeout=args.timeout,
@@ -442,10 +484,7 @@ def run_load_generator(args, sip_manager, stats_cb=None):
                     rtp_port_forced=True,
                     rtcp=args.rtcp,
                     tone_hz=args.rtp_tone,
-                    send_silence=(
-                        _get_flag(args, "rtp_send_silence")
-                        or _get_flag(args, "rtp_always_silence")
-                    ),
+                    send_silence=send_silence,
                     symmetric=args.symmetric_rtp,
                     stats_interval=args.rtp_stats_every,
                 )
@@ -460,11 +499,13 @@ def run_load_generator(args, sip_manager, stats_cb=None):
                 result = f"error({e.errno})"
                 setup_ms = 0
                 break
-        from_uri = (
-            args.from_uri
-            or (f"sip:{num_from}@{args.from_domain_load}" if num_from else "")
-        )
-        final_to_uri = to_uri or f"sip:{num_to}@{args.to_domain_load}"
+            except Exception as e:
+                logger.error(f"LOAD: error en llamada: {e}")
+                with lock:
+                    counters["aborted"] += 1
+                    active.discard(threading.current_thread())
+                return
+
         write_csv_row(
             "calls_summary.csv",
             [ts, call_id, from_uri, final_to_uri, src_port, rtp_port, setup_ms, result],

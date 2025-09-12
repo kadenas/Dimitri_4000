@@ -1369,6 +1369,15 @@ def call_worker(cfg, event_q, sm):
     event_q.put(("log", f"Call result: {result}"))
 
 
+def _build_uri(uri_field, user_field, domain_field):
+    uri = (uri_field or "").strip()
+    if uri:
+        return uri if uri.lower().startswith("sip:") else f"sip:{uri}"
+    user = (user_field or "").strip()
+    dom = (domain_field or "").strip()
+    return f"sip:{user}@{dom}" if user and dom else ""
+
+
 def load_worker(cfg, event_q, stop_event, sm):
     try:
         args = SimpleNamespace(
@@ -1405,7 +1414,11 @@ def load_worker(cfg, event_q, stop_event, sm):
             rate=cfg.get("rate", 1.0),
             max_active=cfg.get("max_active", 1),
         )
-        args.rtp_always_silence = args.rtp_send_silence
+        args.from_uri = _build_uri(cfg.get("from_uri"), cfg.get("from_number_start"), cfg.get("from_domain"))
+        args.to_uri = _build_uri(cfg.get("to_uri"), cfg.get("to_number_start"), cfg.get("to_domain"))
+        args.from_user = (cfg.get("from_number_start") or cfg.get("from_user") or "").strip()
+        args.to_user = (cfg.get("to_number_start") or cfg.get("to_user") or "").strip()
+        args.rtp_always_silence = bool(cfg.get("send_silence", False))
         if (
             args.calls < 1
             or not args.dst
