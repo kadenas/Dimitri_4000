@@ -140,6 +140,7 @@ class App(tk.Tk):
         self.sm = SIPManager(protocol="udp")
         self.load_thread = None
         self.uas_thread = None
+        self.uac_active = 0
         self._build_ui(cfg)
         self.log_handler = LogHandler(self.event_q)
         logging.getLogger().addHandler(self.log_handler)
@@ -454,6 +455,27 @@ class App(tk.Tk):
                 self.state["options"]["rx"] = data
             elif kind == "uac":
                 self.state["uac"].update(data)
+            elif kind == "uac_established":
+                self.uac_active += 1
+                try:
+                    self.bye_uac_btn.config(state="normal")
+                except Exception:
+                    pass
+                try:
+                    self.bye_all_uac_btn.config(state="normal")
+                except Exception:
+                    pass
+            elif kind == "uac_ended":
+                self.uac_active = max(0, self.uac_active - 1)
+                if self.uac_active == 0:
+                    try:
+                        self.bye_uac_btn.config(state="disabled")
+                    except Exception:
+                        pass
+                    try:
+                        self.call_btn.config(state="normal")
+                    except Exception:
+                        pass
             elif kind == "uas":
                 self.state["uas"].update(data)
         self._refresh_status()
@@ -1434,7 +1456,10 @@ def load_worker(cfg, event_q, stop_event, sm):
         return
 
     def stats_cb(snapshot):
-        event_q.put(("uac", snapshot))
+        if isinstance(snapshot, dict) and snapshot.get("type") in {"uac_established", "uac_ended"}:
+            event_q.put((snapshot["type"], snapshot))
+        else:
+            event_q.put(("uac", snapshot))
 
     try:
         run_load_generator(args, sm, stats_cb=stats_cb)

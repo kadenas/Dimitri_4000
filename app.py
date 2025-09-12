@@ -476,7 +476,7 @@ def run_load_generator(args, sip_manager, stats_cb=None):
                     bind_port=src_port,
                     timeout=args.timeout,
                     ring_timeout=args.ring_timeout,
-                    talk_time=args.talk_time,
+                    talk_time=(0 if getattr(args, "talk_time", 0) in (None, 0) else args.talk_time),
                     wait_bye=args.wait_bye,
                     max_call_time=args.max_call_time,
                     codecs=args.codecs,
@@ -505,6 +505,37 @@ def run_load_generator(args, sip_manager, stats_cb=None):
                     counters["aborted"] += 1
                     active.discard(threading.current_thread())
                 return
+
+        if stats_cb and result == "answered":
+            dialog = sip_manager.uac_dialogs.get(call_id)
+            remote_ip = remote_port = None
+            local_p = src_port
+            if dialog:
+                local_p = dialog.local_port
+                if dialog.rtp and dialog.rtp.remote_addr:
+                    remote_ip, remote_port = dialog.rtp.remote_addr
+            try:
+                stats_cb(
+                    {
+                        "type": "uac_established",
+                        "call_id": call_id,
+                        "local_port": local_p,
+                        "remote_ip": remote_ip,
+                        "remote_port": remote_port,
+                    }
+                )
+            except Exception:
+                pass
+            if getattr(args, "talk_time", 0) and args.talk_time > 0:
+                try:
+                    stats_cb({"type": "uac_ended", "call_id": call_id})
+                except Exception:
+                    pass
+        elif stats_cb and result in ("remote-bye", "max-time-bye"):
+            try:
+                stats_cb({"type": "uac_ended", "call_id": call_id})
+            except Exception:
+                pass
 
         write_csv_row(
             "calls_summary.csv",
