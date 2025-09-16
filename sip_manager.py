@@ -1,6 +1,7 @@
 import logging
 import re
 import socket
+import threading
 import time
 import uuid
 import hashlib
@@ -480,6 +481,13 @@ class SIPManager:
         self.cseq_invite = 1
         self.cseq_bye = 1
         self.cseq_options = 1
+        self.early = False
+        self.confirmed = False
+        self.failed = False
+        self.cancel_requested = False
+        self.ring_timer: threading.Timer | None = None
+        self._current_call: dict | None = None
+        self._uac_lock = threading.Lock()
 
     def _new_cseq(self) -> int:
         """Return a random initial CSeq for new dialogs."""
@@ -571,6 +579,78 @@ class SIPManager:
             logger.info("Socket UDP cerrado")
             s.close()
 
+    def _clear_ring_timer(self):
+        if self.ring_timer:
+            try:
+                self.ring_timer.cancel()
+            except Exception:
+                pass
+            self.ring_timer = None
+
+    def _schedule_ring_timer(self, ring_timeout: float):
+        self._clear_ring_timer()
+        if ring_timeout > 0:
+            timer = threading.Timer(ring_timeout, self._on_ring_timeout)
+            timer.daemon = True
+            self.ring_timer = timer
+            timer.start()
+
+    def _reset_call_state(self):
+        self._clear_ring_timer()
+        self.early = False
+        self.confirmed = False
+        self.failed = False
+        self.cancel_requested = False
+        self._current_call = None
+
+    def _on_ring_timeout(self):
+        ctx = self._current_call
+        if not ctx:
+            return
+        if self.confirmed or self.failed:
+            return
+        self.cancel_requested = True
+        logger.info(
+            "Ring timeout alcanzado, enviando CANCEL call_id=%s",
+            ctx.get("call_id"),
+        )
+        self._send_cancel()
+
+    def _send_cancel(self):
+        ctx = self._current_call
+        if not ctx or self.confirmed:
+            return
+        if ctx.get("cancel_sent"):
+            return
+        cancel = build_cancel(
+            ctx["request_uri"],
+            ctx["to_uri"],
+            ctx["local_ip"],
+            ctx["local_port"],
+            ctx["from_uri"],
+            ctx["from_display"],
+            ctx["call_id"],
+            ctx["invite_cseq"],
+            ctx["tag"],
+            ctx["branch"],
+            ctx["contact_user"],
+        )
+        try:
+            ctx["sock"].send(cancel)
+        except OSError as e:
+            if getattr(e, "errno", None) == errno.ECONNREFUSED:
+                logger.error(
+                    "Destino no escucha en %s:%s",
+                    ctx.get("dst_host"),
+                    ctx.get("dst_port"),
+                )
+                return
+            raise
+        logger.info("Enviado CANCEL call_id=%s", ctx["call_id"])
+        self._clear_ring_timer()
+        ctx["cancel_sent"] = True
+        ctx["cancel_deadline"] = time.monotonic() + 5
+
     def place_call(
         self,
         dst_host: str,
@@ -612,6 +692,8 @@ class SIPManager:
         if self.protocol != "udp":
             raise NotImplementedError("Solo UDP por ahora.")
 
+        self._uac_lock.acquire()
+        self._reset_call_state()
         owned_socket = False
         prev_timeout = None
         if self.sock:
@@ -658,7 +740,10 @@ class SIPManager:
             request_uri = make_uri(to_user, dst_host)
 
         contact_user = from_user
-        invite_cseq = self._new_cseq()
+        if cseq_start and self.cseq_invite < cseq_start:
+            self.cseq_invite = cseq_start
+        invite_cseq = self.cseq_invite
+        self.cseq_invite += 1
         auth_username = auth_username or auth_user or from_user
         auth_state = {"nc": 0, "realm": auth_realm, "nonce": None, "opaque": None, "qop": "auth", "proxy": False}
 
@@ -694,6 +779,26 @@ class SIPManager:
             extra_headers=extra_headers,
         )
 
+        self._current_call = {
+            "sock": s,
+            "request_uri": request_uri,
+            "to_uri": to_uri,
+            "local_ip": local_ip,
+            "local_port": local_port,
+            "from_uri": from_uri,
+            "from_display": from_display,
+            "call_id": call_id,
+            "invite_cseq": invite_cseq,
+            "tag": tag,
+            "branch": branch,
+            "contact_user": contact_user,
+            "dst_host": dst_host,
+            "dst_port": dst_port,
+            "cancel_sent": False,
+            "cancel_deadline": None,
+        }
+        self.cancel_requested = False
+
         logger.info(
             f"Enviando INVITE (CSeq={invite_cseq}) a {dst_host}:{dst_port} sent-by={local_ip}:{local_port}"
         )
@@ -705,6 +810,7 @@ class SIPManager:
                     f"Destino no escucha en {dst_host}:{dst_port}"
                 )
             raise
+        self._schedule_ring_timer(ring_timeout)
         t_start = time.monotonic()
         t1 = 0.5
         next_resend = t_start + t1
@@ -840,6 +946,7 @@ class SIPManager:
                         continue
                 if c2 == 200:
                     logger.info("200 OK al BYE")
+                    self.cancel_requested = False
                     break
             return cseq
 
@@ -851,28 +958,28 @@ class SIPManager:
         try:
             while True:
                 now = time.monotonic()
-                if not canceled and now >= ring_deadline:
-                    cancel = build_cancel(
-                        request_uri,
-                        to_uri,
-                        local_ip,
-                        local_port,
-                        from_uri,
-                        from_display,
-                        call_id,
-                        invite_cseq,
-                        tag,
-                        branch,
-                        contact_user,
-                    )
-                    s.send(cancel)
-                    logger.info("Ring timeout, enviado CANCEL")
+                if self.cancel_requested and not canceled:
                     canceled = True
-                    cancel_deadline = now + 5
+                    ctx = self._current_call or {}
+                    cancel_deadline = ctx.get("cancel_deadline")
+                if (
+                    not canceled
+                    and not self.confirmed
+                    and ring_timeout > 0
+                    and now >= ring_deadline
+                ):
+                    self.cancel_requested = True
+                    self._send_cancel()
+                    canceled = True
+                    ctx = self._current_call or {}
+                    cancel_deadline = ctx.get("cancel_deadline")
+                    if cancel_deadline is None:
+                        cancel_deadline = now + 5
                     continue
 
                 if canceled and cancel_deadline and now >= cancel_deadline:
                     result = "canceled-timeout"
+                    self.failed = True
                     break
 
                 try:
@@ -900,6 +1007,7 @@ class SIPManager:
                         continue
                     if not got_provisional:
                         result = "timeout"
+                        self.failed = True
                         break
                     continue
                 except OSError as e:
@@ -912,11 +1020,14 @@ class SIPManager:
 
                 code, reason = status_from_response(data)
                 start, headers = parse_headers(data)
+                cseq_hdr = headers.get("cseq", "")
                 if code is not None and 100 <= code < 200:
                     got_provisional = True
+                    if code in (180, 183):
+                        self.early = True
 
-                if canceled:
-                    if code == 200:
+                if canceled and not self.confirmed:
+                    if code == 200 and "CANCEL" in cseq_hdr.upper():
                         logger.info("200 OK tras CANCEL")
                         continue
                     if code == 487:
@@ -934,6 +1045,8 @@ class SIPManager:
                             contact_user,
                         )
                         s.send(ack)
+                        self._clear_ring_timer()
+                        self.failed = True
                         setup_ms = int((time.monotonic() - t_start) * 1000)
                         result = "canceled"
                         break
@@ -1003,6 +1116,14 @@ class SIPManager:
                             auth_header=(hdr_name, auth_val),
                             extra_headers=extra_headers,
                         )
+                        self._current_call.update(
+                            {
+                                "branch": branch,
+                                "invite_cseq": invite_cseq,
+                                "cancel_sent": False,
+                                "cancel_deadline": None,
+                            }
+                        )
                         logger.info("Reenviando INVITE con autenticacion Digest")
                         try:
                             s.send(invite)
@@ -1013,6 +1134,7 @@ class SIPManager:
                                 )
                                 raise
                             raise
+                        self._schedule_ring_timer(ring_timeout)
                         t_start = time.monotonic()
                         t1 = 0.5
                         next_resend = t_start + t1
@@ -1021,6 +1143,9 @@ class SIPManager:
                         continue
 
                 if code == 200:
+                    if "CANCEL" in cseq_hdr.upper():
+                        logger.info("200 OK al CANCEL (ignorado)")
+                        continue
                     setup_ms = int((time.monotonic() - t_start) * 1000)
                     logger.info(f"200 OK en {setup_ms} ms")
                     to_header = headers.get("to", to_header)
@@ -1034,12 +1159,17 @@ class SIPManager:
                         remote_ip = sdp_info.get("ip") or dst_host
                         remote_port = sdp_info.get("audio_port") or rtp_port
                     pts = sdp_info.get("pts") or []
-                    payload_pt = pts[0] if pts else pt_list[0]
-                    codec_name = sdp_info.get("rtpmap", {}).get(
-                        payload_pt, CODEC_NAME_FROM_PT.get(payload_pt, str(payload_pt))
-                    )
+                    negotiated_pt = next((pt for pt in pts if pt in pt_list), None)
+                    codec_name = None
+                    if negotiated_pt is not None:
+                        codec_name = sdp_info.get("rtpmap", {}).get(
+                            negotiated_pt,
+                            CODEC_NAME_FROM_PT.get(negotiated_pt, str(negotiated_pt)),
+                        )
                     logger.info(
-                        f"Negotiated codec: {codec_name} (PT={payload_pt})"
+                        "Negotiated codec: %s (PT=%s)",
+                        codec_name or "-",
+                        negotiated_pt if negotiated_pt is not None else "-",
                     )
                     to_header = headers.get("to", to_header)
                     contact = headers.get("contact")
@@ -1079,16 +1209,25 @@ class SIPManager:
                         tag,
                         contact_user,
                     )
-                    if payload_pt not in (0, 8):
+                    self.confirmed = True
+                    self._clear_ring_timer()
+                    ctx = self._current_call or {}
+                    ctx["remote_target"] = remote_target
+                    ctx["to_header"] = to_header
+                    if negotiated_pt is None:
                         s.send(ack)
-                        logger.warning("unsupported negotiated codec")
+                        logger.warning(
+                            "unsupported negotiated codec pts=%s local=%s",
+                            pts,
+                            pt_list,
+                        )
                         invite_cseq = send_bye(invite_cseq + 1)
                         result = "unsupported-codec"
                         break
                     rtp = RtpSession(
                         local_ip,
                         rtp_port,
-                        payload_pt,
+                        negotiated_pt,
                         symmetric=symmetric,
                         save_wav=save_wav,
                         forced=rtp_port_forced,
@@ -1103,6 +1242,12 @@ class SIPManager:
                     rtp.start(remote_ip, remote_port)
                     s.send(ack)
                     call_established = True
+                    if self.cancel_requested:
+                        invite_cseq = send_bye(invite_cseq + 1)
+                        self._safe_stop_rtp(self.uac_dialogs.get(call_id))
+                        self.uac_dialogs.pop(call_id, None)
+                        result = "canceled-after-200"
+                        break
                     # register dialog for possible later BYE from GUI/load
                     remote_tag = ""
                     if "tag=" in to_header:
@@ -1221,6 +1366,8 @@ class SIPManager:
                         contact_user,
                     )
                     s.send(ack)
+                    self._clear_ring_timer()
+                    self.failed = True
                     setup_ms = int((time.monotonic() - t_start) * 1000)
                     if code == 486:
                         result = "busy(486)"
@@ -1237,18 +1384,22 @@ class SIPManager:
                     pass
             result = "aborted"
         finally:
-            self.uac_dialogs.pop(call_id, None)
-            if owned_socket:
-                s.close()
-            else:
-                try:
-                    if prev_timeout is not None:
-                        s.settimeout(prev_timeout)
-                    s.connect(("0.0.0.0", 0))
-                except OSError:
-                    pass
-            if 'rtp' in locals():
-                rtp.stop()
+            try:
+                self._reset_call_state()
+                self.uac_dialogs.pop(call_id, None)
+                if owned_socket:
+                    s.close()
+                else:
+                    try:
+                        if prev_timeout is not None:
+                            s.settimeout(prev_timeout)
+                        s.connect(("0.0.0.0", 0))
+                    except OSError:
+                        pass
+                if 'rtp' in locals():
+                    rtp.stop()
+            finally:
+                self._uac_lock.release()
 
         if talk_start:
             talk_s = time.monotonic() - talk_start

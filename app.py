@@ -506,7 +506,8 @@ def run_load_generator(args, sip_manager, stats_cb=None):
                     active.discard(threading.current_thread())
                 return
 
-        if stats_cb and result == "answered":
+        send_established = result in ("answered", "canceled-after-200")
+        if stats_cb and send_established:
             dialog = sip_manager.uac_dialogs.get(call_id)
             remote_ip = remote_port = None
             local_p = src_port
@@ -526,7 +527,10 @@ def run_load_generator(args, sip_manager, stats_cb=None):
                 )
             except Exception:
                 pass
-            if getattr(args, "talk_time", 0) and args.talk_time > 0:
+            should_end = result == "canceled-after-200" or (
+                getattr(args, "talk_time", 0) and args.talk_time > 0
+            )
+            if should_end:
                 try:
                     stats_cb({"type": "uac_ended", "call_id": call_id})
                 except Exception:
@@ -552,7 +556,7 @@ def run_load_generator(args, sip_manager, stats_cb=None):
             ],
         )
         with lock:
-            if result in ("answered", "remote-bye", "max-time-bye"):
+            if result in ("answered", "remote-bye", "max-time-bye", "canceled-after-200"):
                 counters["established"] += 1
             if result.startswith("busy") or result.startswith("rejected(4"):
                 counters["failed_4xx"] += 1
