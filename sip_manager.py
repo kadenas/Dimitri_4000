@@ -12,7 +12,16 @@ import string
 from dataclasses import dataclass
 from typing import Dict, Tuple
 from rtp import RtpSession
-from sdp import build_sdp_offer, build_sdp_answer, parse_sdp, CODEC_NAME_FROM_PT
+from sdp import (
+    build_sdp,
+    parse_sdp,
+    CODEC_NAME_FROM_PT,
+    parse_direction_from_sdp,
+    direction_to_flags,
+    flags_to_direction,
+    intersect_answer,
+    DIRECTION_SET,
+)
 from sdp_utils import parse_sdp_ip_port
 
 logger = logging.getLogger("socket_handler")
@@ -93,27 +102,34 @@ def build_digest_auth(
 
 
 def build_options(
-    dst_host: str, local_ip: str, local_port: int, user: str, cseq: int
+    dst_host: str,
+    local_ip: str,
+    local_port: int,
+    user: str,
+    cseq: int,
+    extra_headers: list[str] | None = None,
 ) -> tuple[str, bytes]:
     """Construye un mensaje OPTIONS y devuelve (call-id, bytes)."""
     call_id = str(uuid.uuid4())
     branch = "z9hG4bK" + call_id.replace("-", "")
     sent_by = f"{local_ip}:{local_port}"  # SIEMPRE con puerto real
-    msg = (
-        f"OPTIONS sip:{dst_host} SIP/2.0\r\n"
-        f"Via: SIP/2.0/UDP {sent_by};branch={branch};rport\r\n"
-        f"Max-Forwards: 70\r\n"
-        f"From: <sip:{user}@{local_ip}>;tag={user}\r\n"
-        f"To: <sip:{dst_host}>\r\n"
-        f"Call-ID: {call_id}\r\n"
-        f"CSeq: {cseq} OPTIONS\r\n"
-        f"Contact: <sip:{user}@{local_ip}>\r\n"
-        f"User-Agent: Dimitri-4000/0.1\r\n"
-        f"Allow: INVITE, ACK, CANCEL, OPTIONS, BYE\r\n"
-        f"Accept: application/sdp\r\n"
-        f"Content-Length: 0\r\n\r\n"
-    )
-    return call_id, msg.encode()
+    lines = [
+        f"OPTIONS sip:{dst_host} SIP/2.0\r\n",
+        f"Via: SIP/2.0/UDP {sent_by};branch={branch};rport\r\n",
+        "Max-Forwards: 70\r\n",
+        f"From: <sip:{user}@{local_ip}>;tag={user}\r\n",
+        f"To: <sip:{dst_host}>\r\n",
+        f"Call-ID: {call_id}\r\n",
+        f"CSeq: {cseq} OPTIONS\r\n",
+        f"Contact: <sip:{user}@{local_ip}>\r\n",
+        "User-Agent: Dimitri-4000/0.1\r\n",
+        "Allow: INVITE, ACK, CANCEL, OPTIONS, BYE\r\n",
+        "Accept: application/sdp\r\n",
+    ]
+    for header in extra_headers or []:
+        lines.append(f"{header}\r\n")
+    lines.append("Content-Length: 0\r\n\r\n")
+    return call_id, "".join(lines).encode()
 
 
 def build_invite(
@@ -132,7 +148,7 @@ def build_invite(
     pai: str | None = None,
     use_pai: bool = False,
     use_pai_asserted: bool = False,
-    extra_headers: str = "",
+    extra_headers: list[str] | None = None,
     auth_header: tuple[str, str] | None = None,
 ) -> bytes:
     sent_by = f"{local_ip}:{local_port}"
@@ -158,7 +174,8 @@ def build_invite(
     if auth_header:
         msg += f"{auth_header[0]}: {auth_header[1]}\r\n"
     if extra_headers:
-        msg += extra_headers
+        for header in extra_headers:
+            msg += f"{header}\r\n"
     msg += (
         "Allow: INVITE, ACK, CANCEL, BYE, OPTIONS\r\n"
         "Content-Type: application/sdp\r\n"
@@ -540,6 +557,7 @@ class SIPManager:
         bind_port: int = 0,
         cseq: int = 1,
         user: str = "dimitri",
+        extra_headers: list[str] | None = None,
     ):
         if self.protocol != "udp":
             raise NotImplementedError("Solo UDP por ahora.")
@@ -560,7 +578,9 @@ class SIPManager:
 
         s.connect((dst_host, dst_port))
         local_ip, local_port = s.getsockname()
-        _call_id, payload = build_options(dst_host, local_ip, local_port, user, cseq)
+        _call_id, payload = build_options(
+            dst_host, local_ip, local_port, user, cseq, extra_headers=extra_headers
+        )
 
         t0 = time.time()
         logger.info(
@@ -687,7 +707,10 @@ class SIPManager:
         symmetric: bool = False,
         save_wav: str | None = None,
         stats_interval: float = 2.0,
-        extra_headers: str = "",
+        extra_headers: list[str] | None = None,
+        sdp_direction: str = "sendrecv",
+        sdp_media_extras: list[str] | None = None,
+        sdp_session_extras: list[str] | None = None,
     ) -> tuple[str, str, int, float]:
         if self.protocol != "udp":
             raise NotImplementedError("Solo UDP por ahora.")
@@ -753,13 +776,34 @@ class SIPManager:
         tag = uuid.uuid4().hex[:8]
         codecs = codecs or [(0, "PCMU"), (8, "PCMA")]
         pt_list = [pt for pt, _ in codecs]
+        extra_headers = list(extra_headers or [])
+        session_extras = list(sdp_session_extras or [])
+        media_extras = list(sdp_media_extras or [])
+        offer_pref = (sdp_direction or "sendrecv").lower()
+        if offer_pref not in DIRECTION_SET:
+            logger.warning("Dirección SDP inválida %s; usando sendrecv", offer_pref)
+            offer_pref = "sendrecv"
         if sdp_offer is not None:
-            sdp_bytes = sdp_offer if isinstance(sdp_offer, bytes) else sdp_offer.encode()
+            sdp_text = sdp_offer.decode() if isinstance(sdp_offer, bytes) else str(sdp_offer)
         else:
-            sdp_bytes = build_sdp_offer(local_ip, rtp_port, codecs)
-        logger.info("Offer SDP PTs=%s; supported locally=[0,8]", pt_list)
-        sdp_str = sdp_bytes.decode()
-        self.logger.info("Extra headers: %r", extra_headers.replace("\r\n", " | "))
+            sdp_text = build_sdp(
+                local_ip,
+                rtp_port,
+                codecs,
+                session_extras=session_extras,
+                media_extras=media_extras,
+                direction=offer_pref,
+            )
+        offer_direction = parse_direction_from_sdp(sdp_text.splitlines())
+        logger.info(
+            "Offer SDP PTs=%s dir=%s; supported locally=[0,8]",
+            pt_list,
+            offer_direction,
+        )
+        if extra_headers:
+            self.logger.info("Extra headers: %s", " | ".join(extra_headers))
+        else:
+            self.logger.info("Extra headers: -")
         invite = build_invite(
             request_uri,
             from_uri,
@@ -770,7 +814,7 @@ class SIPManager:
             invite_cseq,
             tag,
             branch,
-            sdp_str,
+            sdp_text,
             from_display=from_display,
             contact_user=contact_user,
             pai=pai,
@@ -1107,7 +1151,7 @@ class SIPManager:
                             invite_cseq,
                             tag,
                             branch,
-                            sdp_str,
+                            sdp_text,
                             from_display=from_display,
                             contact_user=contact_user,
                             pai=pai,
@@ -1170,6 +1214,20 @@ class SIPManager:
                         "Negotiated codec: %s (PT=%s)",
                         codec_name or "-",
                         negotiated_pt if negotiated_pt is not None else "-",
+                    )
+                    remote_dir = sdp_info.get("direction", "sendrecv") or "sendrecv"
+                    if remote_dir not in DIRECTION_SET:
+                        remote_dir = "sendrecv"
+                    remote_send, remote_recv = direction_to_flags(remote_dir)
+                    local_send = remote_recv
+                    local_recv = remote_send
+                    local_dir = flags_to_direction(local_send, local_recv)
+                    logger.info(
+                        "SDP negotiated dir: offer=%s, answer=%s -> effective: %s local / %s remote",
+                        offer_direction,
+                        remote_dir,
+                        local_dir,
+                        remote_dir,
                     )
                     to_header = headers.get("to", to_header)
                     contact = headers.get("contact")
@@ -1236,6 +1294,8 @@ class SIPManager:
                     rtp.tone_hz = tone_hz
                     rtp.send_silence = send_silence and not tone_hz
                     rtp.stats_interval = stats_interval
+                    rtp.set_sending(local_send)
+                    rtp.set_receiving(local_recv)
                     logger.info(
                         "Starting RTP to %s:%s", remote_ip, remote_port
                     )

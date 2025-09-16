@@ -35,40 +35,57 @@ from sip_manager import (
     build_200,
     build_487,
 )
-from sdp import build_sdp, parse_sdp, PT_FROM_CODEC_NAME, CODEC_NAME_FROM_PT
+from sdp import (
+    build_sdp,
+    parse_sdp,
+    PT_FROM_CODEC_NAME,
+    CODEC_NAME_FROM_PT,
+    DIRECTION_SET,
+    parse_direction_from_sdp,
+    direction_to_flags,
+    flags_to_direction,
+    intersect_answer,
+)
 from rtp import RtpSession
 from core.reactor import Reactor
 from core.options_monitor import OptionsMonitor, register_options_responder
 
-PROHIBITED = {
-    "via",
-    "from",
-    "to",
-    "call-id",
-    "cseq",
-    "contact",
-    "max-forwards",
-    "content-length",
-    "content-type",
-    "v",
-    "f",
-    "t",
-}
+PROHIBITED = {"via", "from", "to", "call-id", "cseq", "contact", "content-length"}
 
 
-def sanitize_extra_headers(raw: str) -> str:
-    lines: list[str] = []
-    for ln in (raw or "").replace("\r", "").split("\n"):
-        ln = ln.strip()
-        if not ln or ":" not in ln:
+def sanitize_extra_headers(raw, *, log=None) -> list[str]:
+    """Return sanitized SIP headers ignoring protected ones."""
+
+    log = log or logger
+    entries: list[str] = []
+    if raw is None:
+        items: list[str] = []
+    elif isinstance(raw, str):
+        items = raw.replace("\r", "").split("\n")
+    else:
+        items = []
+        for elem in raw:
+            if not isinstance(elem, str):
+                continue
+            items.extend(elem.replace("\r", "").split("\n"))
+    for ln in items:
+        line = ln.strip()
+        if not line:
             continue
-        name = ln.split(":", 1)[0].strip().lower()
-        if name in PROHIBITED:
+        if ":" not in line:
+            if log:
+                log.warning("Cabecera extra inválida (sin ':'): %s", line)
             continue
-        lines.append(ln)
-    if not lines:
-        return ""
-    return "".join(f"{x}\r\n" for x in lines)
+        name, value = line.split(":", 1)
+        header = name.strip()
+        if header.lower() in PROHIBITED:
+            if log:
+                log.warning(
+                    "Cabecera extra ignorada: no se permite sobreescribir %s", header
+                )
+            continue
+        entries.append(f"{header}: {value.strip()}")
+    return entries
 
 
 def write_csv_row(path, row, header=None):
@@ -119,6 +136,7 @@ def send_options_periodic(
     cseq_start: int = 1,
     stop_event: threading.Event | None = None,
     cb=None,
+    extra_headers: list[str] | None = None,
 ):
     """Send SIP OPTIONS periodically until stop_event is set."""
     sm = SIPManager(protocol="udp")
@@ -135,6 +153,7 @@ def send_options_periodic(
                 bind_ip=bind_ip,
                 bind_port=src_port,
                 cseq=cseq,
+                extra_headers=extra_headers,
             )
         except OSError:
             counters["other"] += 1
@@ -286,14 +305,52 @@ def parse_args():
         help="Username para Digest si distinto del número de usuario",
     )
     p.add_argument(
+        "--sdp-direction",
+        choices=sorted(DIRECTION_SET),
+        default="sendrecv",
+        help="Dirección SDP preferida (sendrecv por defecto)",
+    )
+    p.add_argument(
+        "--sip-header",
+        action="append",
+        dest="sip_headers",
+        default=[],
+        help="Cabecera SIP extra (repetible)",
+    )
+    p.add_argument(
+        "--sip-headers-file",
+        dest="sip_headers_file",
+        help="Fichero con cabeceras SIP extra (una por línea)",
+    )
+    p.add_argument(
         "--extra-header",
         action="append",
-        default=[],
-        help="Cabecera SIP extra para INVITE. Repetible.",
+        dest="sip_headers",
+        help="(alias) Cabecera SIP extra",
     )
     p.add_argument(
         "--extra-headers-file",
-        help="Fichero con cabeceras extra (una por línea).",
+        dest="sip_headers_file",
+        help="(alias) Fichero con cabeceras extra",
+    )
+    p.add_argument(
+        "--sdp-extra",
+        action="append",
+        dest="sdp_extra",
+        default=[],
+        help="Línea SDP extra (media). Repetible.",
+    )
+    p.add_argument(
+        "--sdp-extras-file",
+        dest="sdp_extras_file",
+        help="Fichero con líneas SDP extra (media)",
+    )
+    p.add_argument(
+        "--sdp-extra-session",
+        action="append",
+        dest="sdp_extra_session",
+        default=[],
+        help="Línea SDP extra a nivel de sesión",
     )
     # Load generator options
     p.add_argument("--load", action="store_true", help="Activa generador de llamadas")
@@ -364,13 +421,28 @@ def parse_args():
             logger.warning("--prefer %s ignorado; no está en --codecs", args.prefer)
             args.prefer = None
 
-    extra_raw = ""
-    if args.extra_headers_file:
-        with open(args.extra_headers_file, "r", encoding="utf-8") as f:
-            extra_raw += f.read() + "\n"
-    for h in (args.extra_header or []):
-        extra_raw += h + "\n"
-    args.extra_headers = sanitize_extra_headers(extra_raw)
+    header_lines: list[str] = []
+    if getattr(args, "sip_headers_file", None):
+        with open(args.sip_headers_file, "r", encoding="utf-8") as f:
+            header_lines.extend(line.rstrip("\n") for line in f)
+    if getattr(args, "sip_headers", None):
+        header_lines.extend(args.sip_headers)
+    args.extra_headers = sanitize_extra_headers(header_lines, log=logger)
+
+    sdp_media_lines: list[str] = []
+    if getattr(args, "sdp_extras_file", None):
+        with open(args.sdp_extras_file, "r", encoding="utf-8") as f:
+            sdp_media_lines.extend(line.rstrip("\n") for line in f)
+    sdp_media_lines.extend(getattr(args, "sdp_extra", []) or [])
+    args.sdp_extras = [ln.strip() for ln in sdp_media_lines if ln.strip()]
+    args.sdp_session_extras = [
+        ln.strip() for ln in (getattr(args, "sdp_extra_session", []) or []) if ln.strip()
+    ]
+
+    args.sdp_direction = (args.sdp_direction or "sendrecv").lower()
+    if args.sdp_direction not in DIRECTION_SET:
+        logger.warning("Dirección SDP inválida %s; usando sendrecv", args.sdp_direction)
+        args.sdp_direction = "sendrecv"
 
     # defaults for load generator
     if args.max_active is None:
@@ -487,6 +559,10 @@ def run_load_generator(args, sip_manager, stats_cb=None):
                     send_silence=send_silence,
                     symmetric=args.symmetric_rtp,
                     stats_interval=args.rtp_stats_every,
+                    extra_headers=args.extra_headers,
+                    sdp_direction=args.sdp_direction,
+                    sdp_media_extras=args.sdp_extras,
+                    sdp_session_extras=args.sdp_session_extras,
                 )
                 break
             except OSError as e:
@@ -746,6 +822,9 @@ def main():
                 save_wav=args.rtp_save_wav,
                 stats_interval=args.rtp_stats_every,
                 extra_headers=args.extra_headers,
+                sdp_direction=args.sdp_direction,
+                sdp_media_extras=args.sdp_extras,
+                sdp_session_extras=args.sdp_session_extras,
             )
         except KeyboardInterrupt:
             raise SystemExit(130)
@@ -932,6 +1011,9 @@ def main():
                             rip = sdp_info.get("ip")
                             rport = sdp_info.get("audio_port")
                             remote_pts = sdp_info.get("pts") or []
+                            offer_dir = sdp_info.get("direction", "sendrecv") or "sendrecv"
+                            if offer_dir not in DIRECTION_SET:
+                                offer_dir = "sendrecv"
                             logger.info(
                                 "Offer SDP PTs=%s; supported locally=[0,8]",
                                 remote_pts,
@@ -981,6 +1063,7 @@ def main():
                                 "local_port": local_port,
                                 "remote_rtp": (rip, rport),
                                 "pt": chosen_pt,
+                                "offer_dir": offer_dir,
                             }
                             dialogs[key] = dialog
                             resp = build_response(
@@ -1102,6 +1185,10 @@ def main():
                                             and not args.rtp_tone
                                         )
                                         rtp.stats_interval = args.rtp_stats_every
+                                        if "ans_send" in dialog:
+                                            rtp.set_sending(bool(dialog["ans_send"]))
+                                        if "ans_recv" in dialog:
+                                            rtp.set_receiving(bool(dialog["ans_recv"]))
                                         rtp.start(rip, rport)
                                         dialog["rtp"] = rtp
                                         if args.uas_talk_time > 0:
@@ -1197,6 +1284,22 @@ def main():
                                 "Contact": f"<sip:{user}@{contact_ip}:{sock.getsockname()[1]}>",
                                 "Content-Type": "application/sdp",
                             }
+                            offer_dir = dialog.get("offer_dir", "sendrecv") or "sendrecv"
+                            if offer_dir not in DIRECTION_SET:
+                                offer_dir = "sendrecv"
+                            answer_dir = intersect_answer(offer_dir, args.sdp_direction)
+                            ans_send, ans_recv = direction_to_flags(answer_dir)
+                            offer_send, offer_recv = direction_to_flags(offer_dir)
+                            remote_effective = flags_to_direction(
+                                offer_send and ans_recv, offer_recv and ans_send
+                            )
+                            logger.info(
+                                "SDP negotiated dir: offer=%s, answer=%s -> effective: %s local / %s remote",
+                                offer_dir,
+                                answer_dir,
+                                answer_dir,
+                                remote_effective,
+                            )
                             sdp = build_sdp(
                                 contact_ip,
                                 args.rtp_port,
@@ -1208,7 +1311,14 @@ def main():
                                         ),
                                     )
                                 ],
+                                session_extras=args.sdp_session_extras,
+                                media_extras=args.sdp_extras,
+                                direction=answer_dir,
                             )
+                            dialog["answer_dir"] = answer_dir
+                            dialog["ans_send"] = ans_send
+                            dialog["ans_recv"] = ans_recv
+                            dialog["remote_direction"] = remote_effective
                             sock.sendto(
                                 build_response(200, "OK", headers, sdp), dialog["peer_addr"]
                             )
@@ -1231,6 +1341,7 @@ def main():
                                     "Contact": f"<sip:{user}@{contact_ip}:{sock.getsockname()[1]}>",
                                     "Content-Type": "application/sdp",
                                 }
+                                answer_dir = dialog.get("answer_dir", args.sdp_direction)
                                 sdp = build_sdp(
                                     contact_ip,
                                     args.rtp_port,
@@ -1242,6 +1353,9 @@ def main():
                                             ),
                                         )
                                     ],
+                                    session_extras=args.sdp_session_extras,
+                                    media_extras=args.sdp_extras,
+                                    direction=answer_dir,
                                 )
                                 sock.sendto(
                                     build_response(200, "OK", headers, sdp),
@@ -1323,6 +1437,7 @@ def main():
                     bind_ip=args.bind_ip,
                     bind_port=args.src_port,
                     cseq=cseq,
+                    extra_headers=args.extra_headers,
                 )
             except OSError as e:
                 logger.error(
