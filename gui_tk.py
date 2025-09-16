@@ -26,6 +26,7 @@ from rtp import RtpSession
 
 from sip_manager import (
     SIPManager,
+    Dialog,
     build_response,
     parse_headers,
     build_options,
@@ -34,6 +35,9 @@ from sip_manager import (
     build_ringing,
     build_200,
     build_487,
+    _route_set_from_record_route,
+    _contact_uri_host_port,
+    strip_brackets,
 )
 from app import run_load_generator, sanitize_extra_headers
 
@@ -1715,16 +1719,55 @@ def uas_worker(cfg, event_q, stop_event, sm):
                         rtp.start(rem_ip, rem_port)
                     except Exception:
                         rtp = None
-                sm.uas_dialogs[call_id] = {
-                    "dst": addr,
-                    "from_uri": to.split(";", 1)[0],
-                    "from_tag": local_tag,
-                    "to_uri": fr.split(";", 1)[0],
-                    "to_tag": remote_tag or "",
-                    "call_id": call_id,
-                    "cseq_next": 1,
-                    "rtp": rtp,
-                }
+                try:
+                    remote_cseq = int(cseq_hdr.split()[0])
+                except (ValueError, IndexError):
+                    remote_cseq = 0
+                contact_hdr = headers.get("contact", "")
+                remote_target = ""
+                if contact_hdr:
+                    uri, host, port = _contact_uri_host_port(contact_hdr)
+                    if port is None:
+                        port = addr[1]
+                        if "@" in uri:
+                            user_part, host_part = uri.split("@", 1)
+                            if ";" in host_part:
+                                host_only, params = host_part.split(";", 1)
+                                uri = f"{user_part}@{host_only}:{port};{params}"
+                            else:
+                                uri = f"{user_part}@{host_part}:{port}"
+                        elif uri.startswith("sip:"):
+                            host_part = uri[4:]
+                            if ";" in host_part:
+                                host_only, params = host_part.split(";", 1)
+                                uri = f"sip:{host_only}:{port};{params}"
+                            else:
+                                uri = f"sip:{host_part}:{port}"
+                    remote_target = strip_brackets(uri)
+                if not remote_target:
+                    remote_target = strip_brackets(fr.split(";", 1)[0]) or f"sip:{addr[0]}:{addr[1]}"
+                local_uri = strip_brackets(to.split(";", 1)[0])
+                remote_uri = strip_brackets(fr.split(";", 1)[0])
+                local_contact_uri = strip_brackets(headers200.get("Contact", ""))
+                route_set = _route_set_from_record_route(headers.get("record-route", ""))
+                sm.uas_dialogs[call_id] = Dialog(
+                    call_id=call_id,
+                    local_uri=local_uri,
+                    remote_uri=remote_uri,
+                    local_tag=local_tag,
+                    remote_tag=remote_tag or "",
+                    route_set=route_set,
+                    remote_target=remote_target,
+                    local_contact=local_contact_uri,
+                    cseq_local=remote_cseq,
+                    cseq_remote=remote_cseq,
+                    sock=sock,
+                    local_ip=local_ip,
+                    local_port=sock.getsockname()[1],
+                    role="uas",
+                    dst=addr,
+                    rtp=rtp,
+                )
                 event_q.put(("uas", {"dialogs": len(sm.uas_dialogs)}))
             elif start.startswith("BYE "):
                 if sm.handle_uas_bye(data, addr):
