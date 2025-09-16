@@ -492,15 +492,32 @@ def run_load_generator(args, sip_manager, stats_cb=None):
     dst = args.dst or args.host
     dport = args.dst_port if args.dst else (args.port or 5060)
 
+    try:
+        pad_width = int(getattr(args, "pad_width", 0) or 0)
+    except (TypeError, ValueError):
+        pad_width = 0
+    try:
+        step = int(getattr(args, "number_step", 1) or 1)
+    except (TypeError, ValueError):
+        step = 1
+    if step < 1:
+        step = 1
+    args.pad_width = pad_width
+    args.number_step = step
+    fixed_numbers = bool(getattr(args, "fixed_numbers", False))
+
     to_start = int(args.to_number_start or 0)
     from_start = int(args.from_number_start or 0)
 
     def format_num(num):
-        return str(num).zfill(args.pad_width) if args.pad_width > 0 else str(num)
+        return str(num).zfill(pad_width) if pad_width > 0 else str(num)
 
     def worker(i):
         nonlocal counters
-        num_to = format_num(to_start + i * args.number_step)
+        if fixed_numbers:
+            num_to = format_num(to_start)
+        else:
+            num_to = format_num(to_start + i * step)
         if args.to_uri_pattern:
             to_uri = args.to_uri_pattern.format(num=num_to, host=args.to_domain_load)
             to_number = None
@@ -508,7 +525,10 @@ def run_load_generator(args, sip_manager, stats_cb=None):
             to_uri = None
             to_number = num_to
         if args.from_number_start:
-            num_from = format_num(from_start + i * args.number_step)
+            if fixed_numbers:
+                num_from = format_num(from_start)
+            else:
+                num_from = format_num(from_start + i * step)
         else:
             num_from = args.from_number or args.from_user
         from_user = num_from

@@ -90,6 +90,7 @@ DEFAULT_CONFIG = {
     "src_port_step": "10",
     "rtp_port_step": "2",
     "ignore_health": False,
+    "fixed_numbers": False,
 }
 
 
@@ -368,6 +369,13 @@ class App(tk.Tk):
         self._add_entry(lf_load, "rtp_port_step", 10, cfg)
         self.entry_rtp_port_step = self.widgets["rtp_port_step"]
         self._add_check(lf_load, "ignore_health", 11, cfg, text="ignorar health")
+        self.var_fixed_numbers = tk.BooleanVar(value=bool(cfg.get("fixed_numbers", False)))
+        ttk.Checkbutton(
+            lf_load,
+            text="usar números fijos",
+            variable=self.var_fixed_numbers,
+        ).grid(row=99, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 0))
+        self.vars["fixed_numbers"] = self.var_fixed_numbers
         self.load_tab_btn = ttk.Button(load, text="Iniciar Generador", command=self.start_load)
         self.load_tab_btn.grid(row=1, column=0, pady=8)
 
@@ -775,6 +783,11 @@ class App(tk.Tk):
         cfg["src_port_base"] = self._int_or(self.entry_src_port_base.get(), 5062)
         cfg["src_port_step"] = self._int_or(self.entry_src_port_step.get(), 10)
         cfg["rtp_port_step"] = self._int_or(self.entry_rtp_port_step.get(), 2)
+        if cfg["number_step"] < 1:
+            cfg["number_step"] = 1
+            if "number_step" in self.vars:
+                self.vars["number_step"].set("1")
+        cfg["fixed_numbers"] = bool(self.var_fixed_numbers.get())
         return cfg
 
     def start_options_monitor(self):
@@ -1543,6 +1556,7 @@ def load_worker(cfg, event_q, stop_event, sm):
             calls=cfg.get("calls", 1),
             rate=cfg.get("rate", 1.0),
             max_active=cfg.get("max_active", 1),
+            fixed_numbers=bool(cfg.get("fixed_numbers", False)),
         )
         args.from_uri = _build_uri(cfg.get("from_uri"), cfg.get("from_number_start"), cfg.get("from_domain"))
         args.to_uri = _build_uri(cfg.get("to_uri"), cfg.get("to_number_start"), cfg.get("to_domain"))
