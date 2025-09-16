@@ -40,6 +40,24 @@ def make_uri(user: str, domain: str) -> str:
     return f"sip:{user}@{domain}"
 
 
+def strip_brackets(uri: str | None) -> str:
+    """Return the URI without surrounding angle brackets."""
+
+    if not uri:
+        return ""
+    value = uri.strip()
+    if "<" in value and ">" in value:
+        value = value.split("<", 1)[1].split(">", 1)[0]
+    return value.strip().lstrip("<").rstrip(">").strip()
+
+
+def bracket(uri: str | None) -> str:
+    """Return the URI wrapped in angle brackets if not empty."""
+
+    clean = strip_brackets(uri)
+    return f"<{clean}>" if clean else ""
+
+
 def status_from_response(data: bytes):
     """Devuelve (codigo, razon) a partir de la primera línea SIP."""
     try:
@@ -250,7 +268,7 @@ def build_cancel(
     return msg.encode()
 
 
-def build_bye_request(
+def build_uac_bye_request(
     request_uri: str,
     to_header: str,
     local_ip: str,
@@ -289,35 +307,6 @@ def build_bye_request(
     if auth_header:
         msg += f"{auth_header[0]}: {auth_header[1]}\r\n"
     msg += "Content-Length: 0\r\n\r\n"
-    return msg.encode()
-
-
-def build_bye_in_dialog(
-    from_uri: str,
-    from_tag: str,
-    to_uri: str,
-    to_tag: str,
-    call_id: str,
-    cseq: int,
-    src_host: str,
-    src_port: int,
-    branch: str | None = None,
-):
-    """Build a BYE within an existing dialog for the UAS side."""
-    if branch is None:
-        branch = "z9hG4bK" + uuid.uuid4().hex[:16]
-    msg = (
-        f"BYE {to_uri} SIP/2.0\r\n"
-        f"Via: SIP/2.0/UDP {src_host}:{src_port};branch={branch};rport\r\n"
-        "Max-Forwards: 70\r\n"
-        f"From: <{from_uri}>;tag={from_tag}\r\n"
-        f"To: <{to_uri}>;tag={to_tag}\r\n"
-        f"Call-ID: {call_id}\r\n"
-        f"CSeq: {cseq} BYE\r\n"
-        f"Contact: <sip:{from_uri.split(':',1)[1]}>\r\n"
-        "User-Agent: Dimitri-4000/0.1\r\n"
-        "Content-Length: 0\r\n\r\n"
-    )
     return msg.encode()
 
 
@@ -410,48 +399,110 @@ def build_487(headers: dict) -> bytes:
     """Shortcut to build a 487 Request Terminated response."""
     return build_response(487, "Request Terminated", headers)
 
-def build_bye(dialog: dict) -> bytes:
-    """Build a BYE request from stored dialog information (UAS side)."""
-    branch = "z9hG4bK" + uuid.uuid4().hex
-    sent_by = f"{dialog['local_ip']}:{dialog['local_port']}"
-    req_uri = dialog.get("peer_uri")
-    from_hdr = f"{dialog['to_uri']};tag={dialog['local_tag']}"
-    to_hdr = dialog['from_uri']
-    cseq = dialog['our_next_cseq']
-    dialog['our_next_cseq'] += 1
-    msg = (
-        f"BYE {req_uri} SIP/2.0\r\n"
-        f"Via: SIP/2.0/UDP {sent_by};branch={branch};rport\r\n"
-        "Max-Forwards: 70\r\n"
-        f"From: {from_hdr}\r\n"
-        f"To: {to_hdr}\r\n"
-        f"Call-ID: {dialog['call_id']}\r\n"
-        f"CSeq: {cseq} BYE\r\n"
-        f"Contact: <sip:dimitri@{dialog['local_ip']}>\r\n"
-        "User-Agent: Dimitri-4000/0.1\r\n"
-        "Content-Length: 0\r\n\r\n"
-    )
-    return msg.encode()
-
-
 @dataclass
 class Dialog:
     """Simple representation of an established SIP dialog."""
 
+    call_id: str
+    local_uri: str
+    remote_uri: str
     local_tag: str
     remote_tag: str
-    call_id: str
-    from_uri: str
-    to_uri: str
     route_set: list[str]
     remote_target: str
-    sock: socket.socket
-    our_next_cseq: int
+    local_contact: str | None
+    cseq_local: int
+    cseq_remote: int
+    sock: socket.socket | None
     local_ip: str
     local_port: int
     role: str
     dst: tuple[str, int] | None = None
     rtp: RtpSession | None = None
+
+
+def build_bye_request(
+    dlg: Dialog, local_ip: str, local_port: int, transport: str = "UDP"
+) -> str:
+    """Return a properly formatted BYE request for the given dialog."""
+
+    branch = "z9hG4bK" + uuid.uuid4().hex
+    request_uri = strip_brackets(dlg.remote_target)
+    from_uri = bracket(dlg.local_uri)
+    to_uri = bracket(dlg.remote_uri)
+    from_header = from_uri
+    if dlg.local_tag:
+        from_header = f"{from_header};tag={dlg.local_tag}" if from_header else f";tag={dlg.local_tag}"
+    to_header = to_uri
+    if dlg.remote_tag:
+        to_header = f"{to_header};tag={dlg.remote_tag}" if to_header else f";tag={dlg.remote_tag}"
+    cseq = dlg.cseq_local + 1
+    dlg.cseq_local = cseq
+    lines = [
+        f"BYE {request_uri} SIP/2.0\r\n",
+        f"Via: SIP/2.0/{transport.upper()} {local_ip}:{local_port};branch={branch};rport\r\n",
+        "Max-Forwards: 70\r\n",
+        f"From: {from_header}\r\n",
+        f"To: {to_header}\r\n",
+        f"Call-ID: {dlg.call_id}\r\n",
+        f"CSeq: {cseq} BYE\r\n",
+    ]
+    for route in dlg.route_set:
+        if route:
+            lines.append(f"Route: {route}\r\n")
+    contact_uri = bracket(dlg.local_contact)
+    if contact_uri:
+        lines.append(f"Contact: {contact_uri}\r\n")
+    lines.append("User-Agent: Dimitri-4000/0.1\r\n")
+    lines.append("Content-Length: 0\r\n\r\n")
+    return "".join(lines)
+
+
+def build_bye(dialog: dict) -> bytes:
+    """Backward-compatible helper to build a BYE from legacy dialog dicts."""
+
+    local_ip = dialog.get("local_ip", "0.0.0.0")
+    try:
+        local_port = int(dialog.get("local_port", 0))
+    except (TypeError, ValueError):
+        local_port = 0
+    try:
+        next_cseq = int(dialog.get("our_next_cseq", 1))
+    except (TypeError, ValueError):
+        next_cseq = 1
+    try:
+        remote_cseq = int(str(dialog.get("their_cseq_invite", 0)))
+    except (TypeError, ValueError):
+        remote_cseq = 0
+    dlg = Dialog(
+        call_id=str(dialog.get("call_id", "")),
+        local_uri=strip_brackets(dialog.get("to_uri")),
+        remote_uri=strip_brackets(dialog.get("from_uri")),
+        local_tag=str(dialog.get("local_tag", "")),
+        remote_tag=str(dialog.get("remote_tag", "")),
+        route_set=list(dialog.get("route_set") or []),
+        remote_target=strip_brackets(
+            dialog.get("peer_uri")
+            or dialog.get("remote_target")
+            or dialog.get("to_uri")
+            or ""
+        ),
+        local_contact=strip_brackets(
+            dialog.get("local_contact")
+            or (f"sip:dimitri@{local_ip}:{local_port}" if local_ip else "")
+        ),
+        cseq_local=max(next_cseq - 1, 0),
+        cseq_remote=remote_cseq,
+        sock=None,
+        local_ip=local_ip,
+        local_port=local_port,
+        role=str(dialog.get("role", "uas")),
+        dst=dialog.get("peer_addr"),
+        rtp=dialog.get("rtp"),
+    )
+    bye_text = build_bye_request(dlg, local_ip, local_port)
+    dialog["our_next_cseq"] = dlg.cseq_local + 1
+    return bye_text.encode()
 
 
 def parse_headers(data: bytes):
@@ -902,7 +953,7 @@ class SIPManager:
                     s.connect((h, p))
                 except Exception:
                     pass
-            bye = build_bye_request(
+            bye = build_uac_bye_request(
                 remote_target,
                 to_header,
                 local_ip,
@@ -971,7 +1022,7 @@ class SIPManager:
                             opaque=opaque,
                         )
                         hdr_name = "Proxy-Authorization" if c2 == 407 else "Authorization"
-                        bye = build_bye_request(
+                        bye = build_uac_bye_request(
                             remote_target,
                             to_hdr,
                             local_ip,
@@ -1312,16 +1363,22 @@ class SIPManager:
                     remote_tag = ""
                     if "tag=" in to_header:
                         remote_tag = to_header.split("tag=")[1].split(";", 1)[0]
+                    try:
+                        remote_cseq = int((headers.get("cseq") or "0").split()[0])
+                    except (ValueError, IndexError):
+                        remote_cseq = 0
                     self.uac_dialogs[call_id] = Dialog(
+                        call_id=call_id,
+                        local_uri=from_uri,
+                        remote_uri=to_uri,
                         local_tag=tag,
                         remote_tag=remote_tag,
-                        call_id=call_id,
-                        from_uri=from_uri,
-                        to_uri=to_uri,
                         route_set=route_set.copy(),
                         remote_target=remote_target,
+                        local_contact=f"sip:{contact_user}@{local_ip}:{local_port}",
+                        cseq_local=invite_cseq,
+                        cseq_remote=remote_cseq,
                         sock=s,
-                        our_next_cseq=invite_cseq + 1,
                         local_ip=local_ip,
                         local_port=local_port,
                         role="uac",
@@ -1535,29 +1592,43 @@ class SIPManager:
         role = role.lower()
         if role == "uas":
             count = 0
-            for call_id, d in list(self.uas_dialogs.items()):
+            for call_id, dlg in list(self.uas_dialogs.items()):
                 try:
-                    src_ip, src_port = self._local_ip_port(self.sock, d["dst"][0], d["dst"][1])
-                    cseq = d.get("cseq_next", 1)
-                    d["cseq_next"] = cseq + 1
-                    bye = build_bye_in_dialog(
-                        from_uri=d["from_uri"],
-                        from_tag=d["from_tag"],
-                        to_uri=d["to_uri"],
-                        to_tag=d["to_tag"],
-                        call_id=d["call_id"],
-                        cseq=cseq,
-                        src_host=src_ip,
-                        src_port=src_port,
-                    )
-                    self.logger.info(
-                        f"UAS BYE -> {d['dst']} call_id={call_id} cseq={cseq}"
-                    )
-                    self.sock.sendto(bye, d["dst"])
+                    if isinstance(dlg, Dialog):
+                        dst = dlg.dst
+                        if not dst:
+                            continue
+                        src_ip, src_port = self._local_ip_port(
+                            self.sock, dst[0], dst[1]
+                        )
+                        bye_text = build_bye_request(
+                            dlg, src_ip, src_port, transport=self.protocol.upper()
+                        )
+                        req_line = bye_text.split("\r\n", 1)[0]
+                        self.logger.info(
+                            "UAS BYE -> %s call_id=%s %s CSeq=%s",
+                            dst,
+                            call_id,
+                            req_line,
+                            dlg.cseq_local,
+                        )
+                        self.sock.sendto(bye_text.encode(), dst)
+                    else:
+                        src_ip, src_port = self._local_ip_port(
+                            self.sock, dlg["dst"][0], dlg["dst"][1]
+                        )
+                        bye = build_bye(dlg)
+                        self.logger.info(
+                            "UAS BYE -> %s call_id=%s %s",
+                            dlg["dst"],
+                            call_id,
+                            bye.decode(errors="ignore").split("\r\n", 1)[0],
+                        )
+                        self.sock.sendto(bye, dlg["dst"])
                 except Exception as e:
                     self.logger.error(f"UAS BYE error call_id={call_id}: {e}")
                 finally:
-                    self._safe_stop_rtp(d)
+                    self._safe_stop_rtp(dlg)
                     self.uas_dialogs.pop(call_id, None)
                     count += 1
             return count
@@ -1565,46 +1636,42 @@ class SIPManager:
         # Default to UAC handling
         dialogs = self.uac_dialogs
         count = 0
-        for key, d in list(dialogs.items()):
-            branch = "z9hG4bK" + uuid.uuid4().hex
-            cseq = getattr(d, "our_next_cseq", self._new_cseq())
-            lines = [
-                f"BYE {d.remote_target} SIP/2.0\r\n",
-                f"Via: SIP/2.0/UDP {d.local_ip}:{d.local_port};branch={branch};rport\r\n",
-                "Max-Forwards: 70\r\n",
-                f"From: <{d.from_uri}>;tag={d.local_tag}\r\n",
-                f"To: <{d.to_uri}>;tag={d.remote_tag}\r\n",
-                f"Call-ID: {d.call_id}\r\n",
-                f"CSeq: {cseq} BYE\r\n",
-                f"Contact: <{d.from_uri}>\r\n",
-                "User-Agent: Dimitri-4000/0.1\r\n",
-            ]
-            for r in d.route_set:
-                lines.append(f"Route: {r}\r\n")
-            lines.append("Content-Length: 0\r\n\r\n")
-            msg = "".join(lines).encode()
-            dst = getattr(d, "dst", None)
+        for key, dlg in list(dialogs.items()):
+            dst = getattr(dlg, "dst", None)
             try:
-                self.logger.info(
-                    f"UAC BYE -> {dst or d.remote_target} call_id={d.call_id} cseq={cseq}"
-                )
-                if dst:
-                    d.sock.sendto(msg, dst)
+                if dst and dlg.sock:
+                    src_ip, src_port = self._local_ip_port(dlg.sock, dst[0], dst[1])
                 else:
-                    d.sock.send(msg)
-                d.sock.settimeout(timeout)
-                try:
-                    while True:
-                        data = d.sock.recv(4096)
-                        code, _ = status_from_response(data)
-                        if code == 200:
-                            break
-                except socket.timeout:
-                    pass
+                    src_ip, src_port = dlg.local_ip, dlg.local_port
+                bye_text = build_bye_request(
+                    dlg, src_ip, src_port, transport=self.protocol.upper()
+                )
+                req_line = bye_text.split("\r\n", 1)[0]
+                self.logger.info(
+                    "UAC BYE -> %s call_id=%s %s",
+                    dst or dlg.remote_target,
+                    dlg.call_id,
+                    req_line,
+                )
+                payload = bye_text.encode()
+                if dst and dlg.sock:
+                    dlg.sock.sendto(payload, dst)
+                elif dlg.sock:
+                    dlg.sock.send(payload)
+                if dlg.sock:
+                    dlg.sock.settimeout(timeout)
+                    try:
+                        while True:
+                            data = dlg.sock.recv(4096)
+                            code, _ = status_from_response(data)
+                            if code == 200:
+                                break
+                    except socket.timeout:
+                        pass
             except OSError as e:
-                self.logger.error(f"UAC BYE error call_id={d.call_id}: {e}")
+                self.logger.error(f"UAC BYE error call_id={dlg.call_id}: {e}")
             finally:
-                self._safe_stop_rtp(d)
+                self._safe_stop_rtp(dlg)
                 dialogs.pop(key, None)
                 count += 1
         return count

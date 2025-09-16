@@ -8,6 +8,7 @@ import pytest
 import app
 
 from sip_manager import (
+    Dialog,
     build_options,
     build_response,
     build_bye,
@@ -127,39 +128,51 @@ def test_allow_unsupported_codecs_flag():
     assert 18 in pts
 
 
-def test_build_bye_uses_dialog_fields():
-    dialog = {
-        "peer_uri": "sip:alice@10.0.0.1",
-        "from_uri": "<sip:alice@10.0.0.1>;tag=rtag",
-        "to_uri": "<sip:bob@10.0.0.2>",
-        "local_tag": "ltag",
-        "call_id": "cid",
-        "our_next_cseq": 1,
-        "local_ip": "10.0.0.2",
-        "local_port": 5060,
-    }
-    msg = build_bye(dialog)
-    text = msg.decode()
-    assert "BYE sip:alice@10.0.0.1 SIP/2.0" in text
-    assert "CSeq: 1 BYE" in text
+def test_build_bye_request_formats_dialog():
+    dlg = Dialog(
+        call_id="cid",
+        local_uri="sip:bob@10.0.0.2",
+        remote_uri="sip:alice@10.0.0.1",
+        local_tag="ltag",
+        remote_tag="rtag",
+        route_set=[],
+        remote_target="sip:alice@10.0.0.1:5070",
+        local_contact="sip:bob@10.0.0.2:5060",
+        cseq_local=2,
+        cseq_remote=7,
+        sock=None,
+        local_ip="10.0.0.2",
+        local_port=5060,
+        role="uas",
+    )
+    text = build_bye_request(dlg, "10.0.0.2", 5060)
+    assert text.startswith("BYE sip:alice@10.0.0.1:5070 SIP/2.0")
     assert "From: <sip:bob@10.0.0.2>;tag=ltag" in text
+    assert "To: <sip:alice@10.0.0.1>;tag=rtag" in text
+    assert "Contact: <sip:bob@10.0.0.2:5060>" in text
+    assert "CSeq: 3 BYE" in text
+    assert "<<" not in text and ">>" not in text
+    assert dlg.cseq_local == 3
 
 
 def test_build_bye_request_includes_route_set():
-    bye = build_bye_request(
-        "sip:bob@10.0.0.1",
-        "<sip:bob@10.0.0.1>;tag=abc",
-        "10.0.0.2",
-        5060,
-        "sip:alice@10.0.0.2",
-        None,
-        "cid",
-        2,
-        "ltag",
-        "+1000",
-        route_set=["<sip:proxy1;lr>", "<sip:proxy2>"]
+    dlg = Dialog(
+        call_id="cid",
+        local_uri="sip:bob@10.0.0.2",
+        remote_uri="sip:alice@10.0.0.1",
+        local_tag="ltag",
+        remote_tag="rtag",
+        route_set=["<sip:proxy1;lr>", "<sip:proxy2>"],
+        remote_target="sip:alice@10.0.0.1",
+        local_contact="sip:bob@10.0.0.2:5060",
+        cseq_local=1,
+        cseq_remote=1,
+        sock=None,
+        local_ip="10.0.0.2",
+        local_port=5060,
+        role="uas",
     )
-    text = bye.decode()
+    text = build_bye_request(dlg, "10.0.0.2", 5060)
     assert "Route: <sip:proxy1;lr>" in text
     assert "Route: <sip:proxy2>" in text
     assert text.index("Route: <sip:proxy1;lr>") < text.index("Route: <sip:proxy2>")
