@@ -827,7 +827,20 @@ class SIPManager:
         tag = uuid.uuid4().hex[:8]
         codecs = codecs or [(0, "PCMU"), (8, "PCMA")]
         pt_list = [pt for pt, _ in codecs]
-        extra_headers = list(extra_headers or [])
+        normalized_headers: list[str] = []
+        for header in extra_headers or []:
+            if isinstance(header, str):
+                line = header.strip()
+                if line:
+                    normalized_headers.append(line)
+            elif isinstance(header, (tuple, list)) and len(header) == 2:
+                name, value = header
+                name_str = str(name).strip()
+                if not name_str:
+                    continue
+                value_str = "" if value is None else str(value).strip()
+                normalized_headers.append(f"{name_str}: {value_str}")
+        extra_headers = normalized_headers
         session_extras = list(sdp_session_extras or [])
         media_extras = list(sdp_media_extras or [])
         offer_pref = (sdp_direction or "sendrecv").lower()
