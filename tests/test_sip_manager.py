@@ -21,7 +21,14 @@ from sip_manager import (
     build_digest_auth,
     _route_set_from_record_route,
 )
-from sdp import build_sdp, parse_sdp
+from sdp import (
+    build_sdp,
+    parse_sdp,
+    direction_to_flags,
+    flags_to_direction,
+    intersect_answer,
+    parse_direction_from_sdp,
+)
 
 
 def test_status_from_response_parses_code_and_reason():
@@ -61,8 +68,8 @@ def test_build_response_generates_basic_sip_message():
 
 def test_build_sdp_returns_valid_structure():
     sdp = build_sdp("10.0.0.1", 4000, [(0, "PCMU")])
-    assert b"c=IN IP4 10.0.0.1" in sdp
-    assert b"m=audio 4000 RTP/AVP 0" in sdp
+    assert "c=IN IP4 10.0.0.1" in sdp
+    assert "m=audio 4000 RTP/AVP 0" in sdp
 
 
 def test_parse_sdp_parses_pts_and_rtpmap():
@@ -77,9 +84,29 @@ def test_parse_sdp_parses_pts_and_rtpmap():
 
 def test_build_sdp_handles_unknown_codec():
     sdp = build_sdp("10.0.0.1", 4000, [(0, "PCMU"), (101, "FOO")])
-    text = sdp.decode()
-    assert "m=audio 4000 RTP/AVP 0 101" in text
-    assert "a=rtpmap:101 FOO/8000" in text
+    assert "m=audio 4000 RTP/AVP 0 101" in sdp
+    assert "a=rtpmap:101 FOO/8000" in sdp
+
+
+def test_direction_helpers():
+    assert direction_to_flags("sendonly") == (True, False)
+    assert flags_to_direction(False, True) == "recvonly"
+    assert intersect_answer("sendrecv", "sendonly") == "sendonly"
+    assert intersect_answer("sendonly", "sendonly") == "inactive"
+
+
+def test_parse_direction_from_sdp_media_priority():
+    sdp_text = "\r\n".join(
+        [
+            "v=0",
+            "o=- 0 0 IN IP4 1.1.1.1",
+            "s=-",
+            "a=sendrecv",
+            "m=audio 1000 RTP/AVP 0",
+            "a=recvonly",
+        ]
+    )
+    assert parse_direction_from_sdp(sdp_text.splitlines()) == "recvonly"
 
 
 def _run_parse_args(args_list):

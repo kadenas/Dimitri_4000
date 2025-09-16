@@ -79,6 +79,8 @@ class RtpSession:
         self.start_time = None
         self.wav_file = None
         self.wav_samples = 0
+        self._send_enabled = True
+        self._recv_enabled = True
 
     def start(self, remote_ip: str | None, remote_port: int | None) -> None:
         base_port = self.rtp_port
@@ -176,6 +178,14 @@ class RtpSession:
             self.stats_thread = threading.Thread(target=self._stats_loop, daemon=True)
             self.stats_thread.start()
 
+    def set_sending(self, enabled: bool) -> None:
+        self._send_enabled = bool(enabled)
+        logger.info("RTP sending %s", "enabled" if self._send_enabled else "disabled")
+
+    def set_receiving(self, enabled: bool) -> None:
+        self._recv_enabled = bool(enabled)
+        logger.info("RTP receiving %s", "enabled" if self._recv_enabled else "disabled")
+
     def set_remote(self, ip: str, port: int) -> None:
         self.remote_addr = (ip, port)
 
@@ -230,6 +240,9 @@ class RtpSession:
             tone_step = 2 * math.pi * self.tone_hz / 8000.0
         silence_byte = 0xFF if self.pt == 0 else 0xD5
         while self.running:
+            if not self._send_enabled:
+                time.sleep(0.02)
+                continue
             if not self.remote_addr:
                 time.sleep(0.02)
                 continue
@@ -269,6 +282,8 @@ class RtpSession:
                 logger.info(
                     "RTP learned remote=%s:%s (symmetric)", addr[0], addr[1]
                 )
+            if not self._recv_enabled:
+                continue
             if len(data) < 12:
                 continue
             seq = struct.unpack("!H", data[2:4])[0]

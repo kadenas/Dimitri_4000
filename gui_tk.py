@@ -10,7 +10,17 @@ from tkinter import ttk, messagebox, filedialog
 from types import SimpleNamespace
 import uuid
 
-from sdp import build_sdp, parse_sdp, PT_FROM_CODEC_NAME, build_sdp_offer
+from sdp import (
+    build_sdp,
+    parse_sdp,
+    PT_FROM_CODEC_NAME,
+    build_sdp_offer,
+    DIRECTION_SET,
+    parse_direction_from_sdp,
+    direction_to_flags,
+    flags_to_direction,
+    intersect_answer,
+)
 from sdp_utils import parse_sdp_ip_port
 from rtp import RtpSession
 
@@ -57,6 +67,9 @@ DEFAULT_CONFIG = {
     "auth_user": "",
     "auth_pass": "",
     "extra_headers": "",
+    "sdp_direction": "sendrecv",
+    "sdp_extra_lines": "",
+    "sdp_extra_session": False,
     "use_auth": False,
     "wait_bye": True,
     "require_health_call": True,
@@ -288,6 +301,37 @@ class App(tk.Tk):
         self.txt_extra_headers = tk.Text(lf_extra, height=6)
         self.txt_extra_headers.pack(fill="both", expand=True)
         self.txt_extra_headers.insert("1.0", cfg.get("extra_headers", ""))
+
+        lf_sdp = ttk.LabelFrame(identity, text="SDP")
+        lf_sdp.grid(row=3, column=0, sticky="nsew", padx=8, pady=4)
+        ttk.Label(lf_sdp, text="SDP direction").grid(row=0, column=0, sticky="w")
+        self.vars["sdp_direction"] = tk.StringVar(
+            value=cfg.get("sdp_direction", "sendrecv")
+        )
+        self.cbo_sdp_dir = ttk.Combobox(
+            lf_sdp,
+            textvariable=self.vars["sdp_direction"],
+            values=sorted(DIRECTION_SET),
+            state="readonly",
+        )
+        self.cbo_sdp_dir.grid(row=0, column=1, sticky="ew", padx=4, pady=2)
+        lf_sdp.columnconfigure(1, weight=1)
+        ttk.Label(
+            lf_sdp, text="Líneas SDP extra (una por línea)", anchor="w"
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        self.txt_sdp_extra = tk.Text(lf_sdp, height=4)
+        self.txt_sdp_extra.grid(row=2, column=0, columnspan=2, sticky="nsew")
+        self.txt_sdp_extra.insert("1.0", cfg.get("sdp_extra_lines", ""))
+        lf_sdp.rowconfigure(2, weight=1)
+        self.vars["sdp_extra_session"] = tk.BooleanVar(
+            value=bool(cfg.get("sdp_extra_session", False))
+        )
+        self.chk_sdp_session = ttk.Checkbutton(
+            lf_sdp,
+            text="SDP extra a nivel de sesión",
+            variable=self.vars["sdp_extra_session"],
+        )
+        self.chk_sdp_session.grid(row=3, column=0, columnspan=2, sticky="w", pady=4)
 
         cfg["src_port_step"] = cfg.get("src_port_step") or "10"
         cfg["rtp_port_step"] = cfg.get("rtp_port_step") or "2"
@@ -710,6 +754,7 @@ class App(tk.Tk):
             messagebox.showerror("Valor inválido", str(exc))
             return None
         cfg["extra_headers"] = self.txt_extra_headers.get("1.0", "end").strip()
+        cfg["sdp_extra_lines"] = self.txt_sdp_extra.get("1.0", "end").strip()
         return cfg
 
     def _get_load_cfg(self):
@@ -757,6 +802,7 @@ class App(tk.Tk):
 
         use_src = bool(self.vars.get("use_src_port_options").get())
         reply_opt = bool(self.vars.get("reply_options").get())
+        extra_headers = sanitize_extra_headers(self.txt_extra_headers.get("1.0", "end"))
 
         if interval <= 0:
             interval = 1.0
@@ -787,6 +833,7 @@ class App(tk.Tk):
             cseq_start=cseq_start,
             reply_options=reply_opt,
             publish_event=pub,
+            extra_headers=extra_headers,
         )
         self.options_thread.start()
         self.monitor_status_lbl.config(text="monitor: ACTIVO", style="Status.OK.TLabel")
@@ -942,6 +989,22 @@ class App(tk.Tk):
         raw = self.txt_extra_headers.get("1.0", "end")
         extra_headers = sanitize_extra_headers(raw)
 
+        sdp_raw = self.txt_sdp_extra.get("1.0", "end")
+        sdp_lines = [ln.strip() for ln in sdp_raw.replace("\r", "").split("\n") if ln.strip()]
+        if self.vars.get("sdp_extra_session") and self.vars["sdp_extra_session"].get():
+            session_extras = sdp_lines
+            media_extras: list[str] = []
+        else:
+            media_extras = sdp_lines
+            session_extras = []
+        sdp_dir = (self.vars.get("sdp_direction").get() if self.vars.get("sdp_direction") else "sendrecv")
+        sdp_dir = (sdp_dir or "sendrecv").lower()
+        if sdp_dir not in DIRECTION_SET:
+            logging.getLogger("gui").warning(
+                "Dirección SDP inválida '%s'; usando sendrecv", sdp_dir
+            )
+            sdp_dir = "sendrecv"
+
         sock = self._ensure_shared_sock()
         local_ip, _ = sock.getsockname()
         if local_ip == "0.0.0.0":
@@ -952,7 +1015,14 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-        sdp_offer = build_sdp_offer(local_ip, rtp_base, codec_pts).decode()
+        sdp_offer = build_sdp(
+            local_ip,
+            rtp_base,
+            codec_pts,
+            session_extras=session_extras,
+            media_extras=media_extras,
+            direction=sdp_dir,
+        )
 
         try:
             from sip_manager import SIPManager
@@ -986,6 +1056,9 @@ class App(tk.Tk):
                 ring_timeout=ring_timeout,
                 wait_bye=wait_bye,
                 extra_headers=extra_headers,
+                sdp_direction=sdp_dir,
+                sdp_media_extras=media_extras,
+                sdp_session_extras=session_extras,
             )
             self.log(
                 f"UAC: call_id={call_id} result={result} setup={setup_ms}ms talk={talk_s}s"
@@ -1161,6 +1234,7 @@ class OptionsMonitorThread(threading.Thread):
         cseq_start,
         reply_options: bool,
         publish_event,
+        extra_headers: list[str] | None = None,
     ):
         super().__init__(daemon=True)
         self.sock = sock
@@ -1175,6 +1249,7 @@ class OptionsMonitorThread(threading.Thread):
         self.last = None
         self.rx = 0
         self.local_ip = None
+        self.extra_headers = list(extra_headers or [])
 
     def run(self):
         sock = self.sock
@@ -1197,7 +1272,12 @@ class OptionsMonitorThread(threading.Thread):
                     except Exception:
                         pass
                 call_id, payload = build_options(
-                    self.dst[0], self.local_ip, local_port, "mon", self.cseq
+                    self.dst[0],
+                    self.local_ip,
+                    local_port,
+                    "mon",
+                    self.cseq,
+                    extra_headers=self.extra_headers,
                 )
                 sock.sendto(payload, self.dst)
                 self.sent += 1
@@ -1358,6 +1438,23 @@ def call_worker(cfg, event_q, sm):
         codecs = [(0, "PCMU"), (8, "PCMA")]
     tone = int(cfg.get("tone_hz", "0") or 0)
     extra_headers = sanitize_extra_headers(cfg.get("extra_headers", ""))
+    sdp_lines = [
+        ln.strip()
+        for ln in (cfg.get("sdp_extra_lines", "") or "").replace("\r", "").split("\n")
+        if ln.strip()
+    ]
+    if cfg.get("sdp_extra_session"):
+        session_extras = sdp_lines
+        media_extras: list[str] = []
+    else:
+        media_extras = sdp_lines
+        session_extras = []
+    sdp_dir = (cfg.get("sdp_direction") or "sendrecv").lower()
+    if sdp_dir not in DIRECTION_SET:
+        logging.getLogger("gui").warning(
+            "Dirección SDP inválida '%s' en config; usando sendrecv", sdp_dir
+        )
+        sdp_dir = "sendrecv"
     try:
         _, result, _, _ = sm.place_call(
             dst_host=dst,
@@ -1376,6 +1473,9 @@ def call_worker(cfg, event_q, sm):
             stats_interval=float(cfg.get("rtp_stats_every", "2.0")),
             wait_bye=cfg.get("wait_bye", True),
             extra_headers=extra_headers,
+            sdp_direction=sdp_dir,
+            sdp_media_extras=media_extras,
+            sdp_session_extras=session_extras,
         )
     except Exception as exc:  # noqa: BLE001
         event_q.put(("log", f"Call error: {exc}"))
@@ -1498,6 +1598,23 @@ def uas_worker(cfg, event_q, stop_event, sm):
         stats_every = float(cfg.get("rtp_stats_every", "2.0") or 2.0)
     except Exception:
         stats_every = 2.0
+    sdp_lines = [
+        ln.strip()
+        for ln in (cfg.get("sdp_extra_lines", "") or "").replace("\r", "").split("\n")
+        if ln.strip()
+    ]
+    if cfg.get("sdp_extra_session"):
+        session_extras = sdp_lines
+        media_extras: list[str] = []
+    else:
+        media_extras = sdp_lines
+        session_extras = []
+    sdp_pref_dir = (cfg.get("sdp_direction") or "sendrecv").lower()
+    if sdp_pref_dir not in DIRECTION_SET:
+        logging.getLogger("gui").warning(
+            "Dirección SDP inválida '%s' en GUI; usando sendrecv", sdp_pref_dir
+        )
+        sdp_pref_dir = "sendrecv"
     event_q.put(("log", "UAS service started"))
     try:
         while not stop_event.is_set():
@@ -1552,7 +1669,30 @@ def uas_worker(cfg, event_q, stop_event, sm):
                     rem_ip, rem_port = parse_sdp_ip_port(body)
                 except ValueError:
                     rem_ip, rem_port = addr[0], rtp_port
-                sdp_ans = build_sdp(local_ip, rtp_port, use_codecs)
+                offer_dir = sdp_info.get("direction", "sendrecv") or "sendrecv"
+                if offer_dir not in DIRECTION_SET:
+                    offer_dir = "sendrecv"
+                answer_dir = intersect_answer(offer_dir, sdp_pref_dir)
+                offer_send, offer_recv = direction_to_flags(offer_dir)
+                ans_send, ans_recv = direction_to_flags(answer_dir)
+                remote_effective = flags_to_direction(
+                    offer_send and ans_recv, offer_recv and ans_send
+                )
+                event_q.put(
+                    (
+                        "log",
+                        "UAS SDP dir: offer=%s answer=%s -> local=%s remote=%s"
+                        % (offer_dir, answer_dir, answer_dir, remote_effective),
+                    )
+                )
+                sdp_ans = build_sdp(
+                    local_ip,
+                    rtp_port,
+                    use_codecs,
+                    session_extras=session_extras,
+                    media_extras=media_extras,
+                    direction=answer_dir,
+                )
                 headers200 = headers_base.copy()
                 headers200.update(
                     {
@@ -1570,6 +1710,8 @@ def uas_worker(cfg, event_q, stop_event, sm):
                         rtp.tone_hz = tone_hz
                         rtp.send_silence = send_silence and not tone_hz
                         rtp.stats_interval = stats_every
+                        rtp.set_sending(ans_send)
+                        rtp.set_receiving(ans_recv)
                         rtp.start(rem_ip, rem_port)
                     except Exception:
                         rtp = None
