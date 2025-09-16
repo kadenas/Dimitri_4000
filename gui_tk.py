@@ -1523,6 +1523,32 @@ def _build_uri(uri_field, user_field, domain_field):
 
 def load_worker(cfg, event_q, stop_event, sm):
     try:
+        raw_extra = cfg.get("extra_headers", "")
+        extra_headers = sanitize_extra_headers(raw_extra)
+        if isinstance(raw_extra, str):
+            extra_headers_text = raw_extra
+        elif raw_extra:
+            extra_headers_text = "\n".join(str(item) for item in raw_extra)
+        else:
+            extra_headers_text = ""
+        sdp_lines = [
+            ln.strip()
+            for ln in (cfg.get("sdp_extra_lines", "") or "").replace("\r", "").split("\n")
+            if ln.strip()
+        ]
+        if cfg.get("sdp_extra_session"):
+            session_extras = sdp_lines
+            media_extras: list[str] = []
+        else:
+            media_extras = sdp_lines
+            session_extras = []
+        sdp_dir = (cfg.get("sdp_direction") or "sendrecv").lower()
+        if sdp_dir not in DIRECTION_SET:
+            logging.getLogger("gui").warning(
+                "Dirección SDP inválida '%s' en config; usando sendrecv",
+                sdp_dir,
+            )
+            sdp_dir = "sendrecv"
         args = SimpleNamespace(
             dst=cfg.get("dst_host"),
             dst_port=cfg.get("dst_port", 5060),
@@ -1557,6 +1583,11 @@ def load_worker(cfg, event_q, stop_event, sm):
             rate=cfg.get("rate", 1.0),
             max_active=cfg.get("max_active", 1),
             fixed_numbers=bool(cfg.get("fixed_numbers", False)),
+            extra_headers=extra_headers,
+            extra_headers_text=extra_headers_text,
+            sdp_direction=sdp_dir,
+            sdp_extras=media_extras,
+            sdp_session_extras=session_extras,
         )
         args.from_uri = _build_uri(cfg.get("from_uri"), cfg.get("from_number_start"), cfg.get("from_domain"))
         args.to_uri = _build_uri(cfg.get("to_uri"), cfg.get("to_number_start"), cfg.get("to_domain"))

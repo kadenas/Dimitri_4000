@@ -88,6 +88,37 @@ def sanitize_extra_headers(raw, *, log=None) -> list[str]:
     return entries
 
 
+def _parse_extra_headers(raw, *, log=None) -> list[str]:
+    """Normalize optional extra headers to a sanitized list of strings."""
+
+    if raw is None:
+        return []
+    log = log or logger
+    if isinstance(raw, dict):
+        iterable = raw.items()
+    elif isinstance(raw, str):
+        iterable = [raw]
+    else:
+        try:
+            iterable = list(raw)
+        except TypeError:
+            iterable = []
+    items: list[str] = []
+    for entry in iterable:
+        if isinstance(entry, str):
+            items.append(entry)
+        elif isinstance(entry, (tuple, list)) and len(entry) == 2:
+            name, value = entry
+            name_str = str(name).strip()
+            value_str = str(value).strip()
+            if not name_str:
+                continue
+            items.append(f"{name_str}: {value_str}")
+    if not items and isinstance(raw, str):
+        items = [raw]
+    return sanitize_extra_headers(items, log=log)
+
+
 def write_csv_row(path, row, header=None):
     new_file = not os.path.exists(path)
     with open(path, "a", newline="") as f:
@@ -509,6 +540,44 @@ def run_load_generator(args, sip_manager, stats_cb=None):
     to_start = int(args.to_number_start or 0)
     from_start = int(args.from_number_start or 0)
 
+    base_extra_headers = _parse_extra_headers(getattr(args, "extra_headers", None), log=logger)
+    if not base_extra_headers:
+        base_extra_headers = _parse_extra_headers(
+            getattr(args, "extra_headers_text", None),
+            log=logger,
+        )
+
+    def _coerce_str_list(value):
+        if value is None:
+            return []
+        if isinstance(value, str):
+            raw_items = value.replace("\r", "").split("\n")
+        else:
+            try:
+                raw_items = list(value)
+            except TypeError:
+                return []
+        cleaned: list[str] = []
+        for item in raw_items:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                cleaned.append(text)
+        return cleaned
+
+    sdp_media_extras = _coerce_str_list(getattr(args, "sdp_extras", []))
+    sdp_session_extras = _coerce_str_list(getattr(args, "sdp_session_extras", []))
+    sdp_direction = (getattr(args, "sdp_direction", "sendrecv") or "sendrecv").lower()
+    if sdp_direction not in DIRECTION_SET:
+        logger.warning("Dirección SDP inválida %s; usando sendrecv", sdp_direction)
+        sdp_direction = "sendrecv"
+
+    args.extra_headers = base_extra_headers
+    args.sdp_extras = sdp_media_extras
+    args.sdp_session_extras = sdp_session_extras
+    args.sdp_direction = sdp_direction
+
     def format_num(num):
         return str(num).zfill(pad_width) if pad_width > 0 else str(num)
 
@@ -579,10 +648,10 @@ def run_load_generator(args, sip_manager, stats_cb=None):
                     send_silence=send_silence,
                     symmetric=args.symmetric_rtp,
                     stats_interval=args.rtp_stats_every,
-                    extra_headers=args.extra_headers,
-                    sdp_direction=args.sdp_direction,
-                    sdp_media_extras=args.sdp_extras,
-                    sdp_session_extras=args.sdp_session_extras,
+                    extra_headers=base_extra_headers,
+                    sdp_direction=sdp_direction,
+                    sdp_media_extras=sdp_media_extras,
+                    sdp_session_extras=sdp_session_extras,
                 )
                 break
             except OSError as e:
