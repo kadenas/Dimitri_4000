@@ -473,6 +473,10 @@ class App(tk.Tk):
                     except Exception:
                         pass
                     try:
+                        self.bye_all_uac_btn.config(state="disabled")
+                    except Exception:
+                        pass
+                    try:
                         self.call_btn.config(state="normal")
                     except Exception:
                         pass
@@ -1376,7 +1380,7 @@ def call_worker(cfg, event_q, sm):
     except Exception as exc:  # noqa: BLE001
         event_q.put(("log", f"Call error: {exc}"))
         result = "error"
-    if result in ("answered", "remote-bye", "max-time-bye"):
+    if result in ("answered", "remote-bye", "max-time-bye", "canceled-after-200"):
         counters["established"] += 1
     if result.startswith("rejected(4") or result.startswith("busy"):
         counters["failed_4xx"] += 1
