@@ -1,0 +1,9 @@
+{
+  "name": "Varadero Mosquera",
+  "short_name": "Varadero",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#071a33",
+  "theme_color": "#0f355f",
+  "icons": []
+}
