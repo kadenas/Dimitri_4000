@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from sip_manager import SIPManager
 from app import run_load_generator
+from socket_handler import get_sip_transport
 
 # Default configuration values for editable fields
 DEFAULT_CONFIG = {
@@ -248,7 +249,8 @@ def controller(cmd_q, event_q, stop_event):
 
 def options_worker(cfg, event_q):
     counters = {"sent": 0, "ok": 0, "other": 0, "timeout": 0}
-    sm = SIPManager(protocol="udp")
+    sip_transport = get_sip_transport(cfg.get("bind_ip") or "0.0.0.0", int(cfg.get("src_port", "0") or 0))
+    sm = SIPManager(protocol="udp", transport=sip_transport)
     dst = cfg.get("dst_host")
     dport = int(cfg.get("dst_port", 5060))
     for _ in range(3):
@@ -331,8 +333,8 @@ def load_worker(cfg, event_q, stop_event):
         from_user="dimitri",
         to_domain_load=cfg.get("to_domain") or cfg.get("dst_host"),
         from_domain_load=cfg.get("from_domain") or (cfg.get("bind_ip") or ""),
-        src_port_base=int(cfg.get("src_port", "0")),
-        src_port_step=10,
+        src_port_base=0,
+        src_port_step=0,
         rtp_port_base=int(cfg.get("rtp_port_base", "40000")),
         rtp_port_step=2,
         bind_ip=cfg.get("bind_ip") or None,
@@ -351,12 +353,13 @@ def load_worker(cfg, event_q, stop_event):
         rate=float(cfg.get("rate", "1.0")),
         max_active=int(cfg.get("max_active", "1")),
     )
-    sm = SIPManager(protocol="udp")
+    sip_transport = get_sip_transport(cfg.get("bind_ip") or "0.0.0.0", int(cfg.get("src_port", "0") or 0))
+    sm = SIPManager(protocol="udp", transport=sip_transport)
 
     def stats_cb(snapshot):
         event_q.put(("uac", snapshot))
 
-    run_load_generator(args, sm, stats_cb=stats_cb)
+    run_load_generator(args, sm, sip_transport, stats_cb=stats_cb)
     event_q.put(("log", "Load finished"))
 
 
@@ -367,4 +370,3 @@ def uas_worker(cfg, event_q, stop_event):
             time.sleep(0.5)
     finally:
         event_q.put(("log", "UAS service stopped"))
-

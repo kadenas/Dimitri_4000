@@ -12,6 +12,47 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 
+class SipTransport:
+    def __init__(self, bind_ip: str, src_port: int):
+        self.bind_ip = bind_ip
+        self.src_port = int(src_port)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except Exception:
+            pass
+        self.sock.bind((bind_ip, self.src_port))
+        self.sock.settimeout(0.5)
+
+    def sendto(self, data: bytes, dst_addr):
+        return self.sock.sendto(data, dst_addr)
+
+    def recvfrom(self, bufsize: int = 65535):
+        return self.sock.recvfrom(bufsize)
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+_SIP_TRANSPORT: SipTransport | None = None
+
+
+def get_sip_transport(bind_ip: str, src_port: int) -> SipTransport:
+    """Return a singleton SipTransport for the provided bind_ip/src_port."""
+    global _SIP_TRANSPORT
+    if _SIP_TRANSPORT is None:
+        _SIP_TRANSPORT = SipTransport(bind_ip, src_port)
+    else:
+        if _SIP_TRANSPORT.bind_ip != bind_ip or _SIP_TRANSPORT.src_port != int(src_port):
+            _SIP_TRANSPORT.close()
+            _SIP_TRANSPORT = SipTransport(bind_ip, src_port)
+    return _SIP_TRANSPORT
+
+
 def _validate_ip(ip: str) -> None:
     """Raise ValueError if *ip* is not a valid IPv4 or IPv6 address."""
     try:

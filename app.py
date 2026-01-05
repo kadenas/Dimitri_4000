@@ -8,6 +8,7 @@ import time
 import uuid
 import sys
 import errno
+import queue
 import threading
 import secrets
 from datetime import datetime, UTC
@@ -53,6 +54,7 @@ from sdp import (
 from rtp import RtpSession
 from core.reactor import Reactor
 from core.options_monitor import OptionsMonitor, register_options_responder
+from socket_handler import SipTransport, get_sip_transport
 
 PROHIBITED = {"via", "from", "to", "call-id", "cseq", "contact", "content-length"}
 
@@ -257,7 +259,18 @@ def build_bye_simple(
     return msg.encode()
 
 
-def generator_call_worker(sock, local_ip, dst_addr, base_args, per_call_args, stats_cb=None):
+def generator_call_worker(
+    transport: SipTransport,
+    sip_ip: str,
+    sip_port: int,
+    sdp_ip: str,
+    dst_addr,
+    base_args,
+    per_call_args,
+    call_id: str,
+    rx_queue,
+    stats_cb=None,
+):
     """
     sock: UDP ya bindeado (puerto src)
     dst_addr: (ip, port) destino
@@ -266,7 +279,6 @@ def generator_call_worker(sock, local_ip, dst_addr, base_args, per_call_args, st
     """
     log = logging.getLogger("load-call")
     start_ts = time.time()
-    call_id = f"{uuid.uuid4()}"
     local_tag = secrets.token_hex(4)
     dialog = SIPDialog(call_id, local_tag)
 
@@ -281,7 +293,7 @@ def generator_call_worker(sock, local_ip, dst_addr, base_args, per_call_args, st
         sdp_mode = getattr(base_args, "sdp_direction", "sendrecv")
     dialog.mode = sdp_mode
     offer_sdp = build_sdp(
-        local_ip,
+        sdp_ip,
         per_call_args.rtp_port,
         codecs,
         session_extras=getattr(base_args, "sdp_session_extras", []),
@@ -293,12 +305,12 @@ def generator_call_worker(sock, local_ip, dst_addr, base_args, per_call_args, st
     branch = "z9hG4bK" + uuid.uuid4().hex
     dialog.branch = branch
     contact_user = getattr(per_call_args, "from_user", None) or "u"
-    local_port = getattr(per_call_args, "src_port", None) or sock.getsockname()[1]
+    local_port = sip_port
     invite = build_invite(
         request_uri=per_call_args.to_uri,
         from_uri=per_call_args.from_uri,
         to_uri=per_call_args.to_uri,
-        local_ip=local_ip,
+        local_ip=sip_ip,
         local_port=local_port,
         call_id=call_id,
         cseq=cseq,
@@ -308,7 +320,7 @@ def generator_call_worker(sock, local_ip, dst_addr, base_args, per_call_args, st
         contact_user=contact_user,
         extra_headers=getattr(per_call_args, "extra_headers_list", []),
     )
-    sock.sendto(invite, dst_addr)
+    transport.sendto(invite, dst_addr)
 
     ring_timeout = float(getattr(base_args, "ring_timeout", 10.0))
     ring_deadline = time.time() + ring_timeout
@@ -322,14 +334,13 @@ def generator_call_worker(sock, local_ip, dst_addr, base_args, per_call_args, st
     t_end = time.time() + talk_time if talk_time > 0 else None
     max_end = time.time() + max_call_time if max_call_time > 0 else None
 
-    sock.settimeout(0.5)
     while True:
         now = time.time()
         if not established and now > ring_deadline:
             cancel = build_cancel(
                 request_uri=per_call_args.to_uri,
                 to_uri=per_call_args.to_uri,
-                local_ip=local_ip,
+                local_ip=sip_ip,
                 local_port=local_port,
                 from_uri=per_call_args.from_uri,
                 from_display=None,
@@ -339,7 +350,7 @@ def generator_call_worker(sock, local_ip, dst_addr, base_args, per_call_args, st
                 branch=branch,
                 contact_user=contact_user,
             )
-            sock.sendto(cancel, dst_addr)
+            transport.sendto(cancel, dst_addr)
             log.info("CANCEL enviado call-id=%s", call_id)
             result = "canceled"
             break
@@ -357,7 +368,7 @@ def generator_call_worker(sock, local_ip, dst_addr, base_args, per_call_args, st
                 to_tag=dialog.remote_tag,
                 contact_user=contact_user,
             )
-            sock.sendto(bye, dst_addr)
+            transport.sendto(bye, dst_addr)
             bye_sent = True
             result = "max-time-bye"
 
@@ -374,13 +385,13 @@ def generator_call_worker(sock, local_ip, dst_addr, base_args, per_call_args, st
                 to_tag=dialog.remote_tag,
                 contact_user=contact_user,
             )
-            sock.sendto(bye, dst_addr)
+            transport.sendto(bye, dst_addr)
             bye_sent = True
             result = "max-time-bye"
 
         try:
-            data, addr = sock.recvfrom(65535)
-        except socket.timeout:
+            data, addr = rx_queue.get(timeout=0.5)
+        except queue.Empty:
             continue
         except OSError:
             result = "aborted"
@@ -402,7 +413,7 @@ def generator_call_worker(sock, local_ip, dst_addr, base_args, per_call_args, st
             ack = build_ack(
                 request_uri=per_call_args.to_uri,
                 to_header=headers.get("to", f"<{per_call_args.to_uri}>"),
-                local_ip=local_ip,
+                local_ip=sip_ip,
                 local_port=local_port,
                 from_uri=per_call_args.from_uri,
                 from_display=None,
@@ -411,7 +422,7 @@ def generator_call_worker(sock, local_ip, dst_addr, base_args, per_call_args, st
                 tag=local_tag,
                 contact_user=contact_user,
             )
-            sock.sendto(ack, dst_addr)
+            transport.sendto(ack, dst_addr)
             dialog.ack_sent = True
             established = True
             dialog.established = True
@@ -422,7 +433,7 @@ def generator_call_worker(sock, local_ip, dst_addr, base_args, per_call_args, st
                 try:
                     start_rtp_for_dialog(
                         dialog,
-                        local_ip,
+                        sdp_ip,
                         per_call_args.rtp_port,
                         pt_prefer,
                         getattr(base_args, "rtp_tone", 0) or 0,
@@ -451,7 +462,7 @@ def generator_call_worker(sock, local_ip, dst_addr, base_args, per_call_args, st
         if msg_start.startswith("BYE "):
             resp = build_response_ok_from_request(data)
             if resp:
-                sock.sendto(resp, addr)
+                transport.sendto(resp, addr)
             stop_rtp_for_dialog(dialog)
             log.info("BYE remoto atendido call-id=%s", call_id)
             result = "remote-bye" if established else "aborted"
@@ -913,8 +924,6 @@ def make_per_call_args(
     i,
     fixed_numbers=False,
     num_step=1,
-    src_port_base=None,
-    src_port_step=0,
     rtp_port_base=None,
     rtp_port_step=2,
 ):
@@ -937,8 +946,6 @@ def make_per_call_args(
             )
 
     # Puertos
-    if src_port_base:
-        a.src_port = int(src_port_base) + i * int(src_port_step or 0)
     if rtp_port_base:
         a.rtp_port = int(rtp_port_base) + i * int(rtp_port_step or 2)
 
@@ -953,7 +960,7 @@ def make_per_call_args(
     return a
 
 
-def run_load_generator(args, sip_manager, stats_cb=None):
+def run_load_generator(args, sip_manager, sip_transport: SipTransport, stats_cb=None):
     """Generate many calls with controlled rate and incremental parameters.
 
     Parameters
@@ -1060,18 +1067,6 @@ def run_load_generator(args, sip_manager, stats_cb=None):
     def format_num(num):
         return str(num).zfill(pad_width) if pad_width > 0 else str(num)
 
-    shared_sock = None
-    if not args.src_port_base:
-        try:
-            shared_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            shared_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            shared_sock.bind((args.bind_ip or "0.0.0.0", getattr(args, "src_port", 0) or 0))
-        except OSError as e:
-            logger.error(
-                f"No se pudo bindear UDP en {args.bind_ip or '0.0.0.0'}:{getattr(args, 'src_port', 0)}: {e}"
-            )
-            raise SystemExit(1)
-
     def _resolve_local_ip(sock):
         if args.bind_ip and args.bind_ip != "0.0.0.0":
             return args.bind_ip
@@ -1085,15 +1080,37 @@ def run_load_generator(args, sip_manager, stats_cb=None):
                 local_ip = sock.getsockname()[0]
         return local_ip
 
+    sip_ip = sip_transport.bind_ip
+    sip_port = sip_transport.src_port
+
+    call_queues: dict[str, queue.Queue] = {}
+    rx_stop = threading.Event()
+
+    def rx_loop():
+        while not rx_stop.is_set():
+            try:
+                data, addr = sip_transport.recvfrom()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            _, headers = parse_headers(data)
+            call_id = headers.get("call-id")
+            if not call_id:
+                continue
+            with lock:
+                q = call_queues.get(call_id)
+            if q:
+                q.put((data, addr))
+
     def worker(i):
         nonlocal counters
+        local_ip = _resolve_local_ip(sip_transport.sock)
         call_args = make_per_call_args(
             args,
             i,
             fixed_numbers=fixed_numbers,
             num_step=step,
-            src_port_base=args.src_port_base,
-            src_port_step=args.src_port_step,
             rtp_port_base=args.rtp_port_base,
             rtp_port_step=args.rtp_port_step,
         )
@@ -1139,13 +1156,11 @@ def run_load_generator(args, sip_manager, stats_cb=None):
                 active.discard(threading.current_thread())
             return
 
-        src_port = getattr(call_args, "src_port", 0) if args.src_port_base else 0
         rtp_port = getattr(call_args, "rtp_port", args.rtp_port_base)
         if rtp_port % 2:
             rtp_port += 1
         ts = datetime.now(UTC).isoformat()
         call_args.rtp_port = rtp_port
-        call_args.src_port = src_port if src_port else None
         send_silence = bool(
             getattr(args, "rtp_send_silence", False)
             or getattr(args, "rtp_always_silence", False)
@@ -1154,24 +1169,26 @@ def run_load_generator(args, sip_manager, stats_cb=None):
         call_args.codecs = args.codecs
         call_args.extra_headers_list = call_args.extra_headers_list or base_extra_headers
 
+        call_id = f"{uuid.uuid4()}"
+        call_id_key = call_id
         try:
-            if call_args.src_port:
-                s_worker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s_worker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s_worker.bind((args.bind_ip or "0.0.0.0", int(call_args.src_port)))
-            else:
-                s_worker = shared_sock
-            local_ip = _resolve_local_ip(s_worker)
+            rx_queue: queue.Queue = queue.Queue()
+            with lock:
+                call_queues[call_id_key] = rx_queue
             call_id, result, setup_ms, dialog = generator_call_worker(
-                s_worker,
+                sip_transport,
+                sip_ip,
+                sip_port,
                 local_ip,
                 (dst, int(dport)),
                 args,
                 call_args,
+                call_id_key,
+                rx_queue,
                 stats_cb=stats_cb,
             )
         except OSError as e:
-            call_id = ""
+            call_id = call_id_key
             result = f"error({getattr(e, 'errno', 'socket')})"
             setup_ms = 0
         except Exception as e:
@@ -1181,15 +1198,12 @@ def run_load_generator(args, sip_manager, stats_cb=None):
                 active.discard(threading.current_thread())
             return
         finally:
-            if call_args.src_port and s_worker:
-                try:
-                    s_worker.close()
-                except Exception:
-                    pass
+            with lock:
+                call_queues.pop(call_id_key, None)
 
         write_csv_row(
             "calls_summary.csv",
-            [ts, call_id, from_uri, final_to_uri, src_port, rtp_port, setup_ms, result],
+            [ts, call_id, from_uri, final_to_uri, sip_port, rtp_port, setup_ms, result],
             [
                 "ts_start",
                 "call_id",
@@ -1240,6 +1254,8 @@ def run_load_generator(args, sip_manager, stats_cb=None):
             if stop.wait(2):
                 break
 
+    rx_thread = threading.Thread(target=rx_loop, daemon=True)
+    rx_thread.start()
     printer_t = threading.Thread(target=printer, daemon=True)
     printer_t.start()
 
@@ -1269,11 +1285,8 @@ def run_load_generator(args, sip_manager, stats_cb=None):
         t.join()
     stop.set()
     printer_t.join()
-    if shared_sock:
-        try:
-            shared_sock.close()
-        except Exception:
-            pass
+    rx_stop.set()
+    rx_thread.join(timeout=1.0)
     if stats_cb:
         with lock:
             final = counters.copy()
@@ -1328,8 +1341,9 @@ def main():
     if args.load:
         if not (args.dst or args.host):
             raise SystemExit("Falta destino: usa --dst 10.0.0.1")
-        sm = SIPManager(protocol=args.protocol)
-        run_load_generator(args, sm)
+        sip_transport = get_sip_transport(args.bind_ip or "0.0.0.0", args.src_port)
+        sm = SIPManager(protocol=args.protocol, transport=sip_transport)
+        run_load_generator(args, sm, sip_transport)
         return
 
     if args.uas and not args.service:
@@ -1357,7 +1371,8 @@ def main():
         to_uri = args.to_uri
         if not to_uri and args.to:
             to_uri = args.to if args.to.startswith("sip:") else f"sip:{args.to}"
-        sm = SIPManager(protocol=args.protocol)
+        sip_transport = get_sip_transport(args.bind_ip or "0.0.0.0", args.src_port)
+        sm = SIPManager(protocol=args.protocol, transport=sip_transport)
         extra_headers = (
             getattr(args, "extra_headers_list", None)
             or getattr(args, "extra_headers", [])
@@ -1431,9 +1446,8 @@ def main():
             raise SystemExit("En modo servicio se requiere --dst o --reply-options")
 
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(((args.bind_ip or "0.0.0.0"), args.src_port or 0))
+            sip_transport = get_sip_transport(args.bind_ip or "0.0.0.0", args.src_port)
+            sock = sip_transport.sock
         except OSError as e:
             logger.error(
                 f"No se pudo bindear UDP en {args.bind_ip or '0.0.0.0'}:{args.src_port}: {e}"
@@ -1441,12 +1455,14 @@ def main():
             raise SystemExit(1)
 
         local_ip = args.bind_ip or sock.getsockname()[0]
-        local_port = sock.getsockname()[1]
+        local_port = sip_transport.src_port
+        sip_ip = sip_transport.bind_ip
         local_pts = [pt for pt, _ in args.codecs if pt in (0, 8)]
         if not local_pts:
             local_pts = [0, 8]
         first_pt = local_pts[0]
-        contact_ip = args.advertised_ip or local_ip
+        contact_ip = sip_ip
+        sdp_ip = args.advertised_ip or local_ip
         user = "dimitri"
         tag_local = uuid.uuid4().hex[:8]
         pending = []  # call_id -> send_time
@@ -1535,17 +1551,7 @@ def main():
                         else:
                             if "tag=" not in to.lower():
                                 to = f"{to};tag={tag_local}"
-                            if args.bind_ip:
-                                contact_ip_resp = args.bind_ip
-                            else:
-                                tmp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                                try:
-                                    tmp.connect(addr)
-                                    contact_ip_resp = tmp.getsockname()[0]
-                                except OSError:
-                                    contact_ip_resp = sock.getsockname()[0]
-                                finally:
-                                    tmp.close()
+                            contact_ip_resp = sip_ip
                             resp = (
                                 "SIP/2.0 200 OK\r\n"
                                 f"Via: {via}\r\n"
@@ -1553,7 +1559,7 @@ def main():
                                 f"To: {to}\r\n"
                                 f"Call-ID: {call_id}\r\n"
                                 f"CSeq: {cseq_hdr}\r\n"
-                                f"Contact: <sip:{user}@{contact_ip_resp}:{sock.getsockname()[1]}>\r\n"
+                                f"Contact: <sip:{user}@{contact_ip_resp}:{local_port}>\r\n"
                                 "User-Agent: Dimitri-4000/0.1\r\n"
                                 "Allow: INVITE, ACK, CANCEL, OPTIONS, BYE\r\n"
                                 "Accept: application/sdp\r\n"
@@ -1861,7 +1867,7 @@ def main():
                                 "To": f"{dialog['to_uri']};tag={dialog['local_tag']}",
                                 "Call-ID": dialog["call_id"],
                                 "CSeq": dialog["cseq_hdr"],
-                                "Contact": f"<sip:{user}@{contact_ip}:{sock.getsockname()[1]}>",
+                                "Contact": f"<sip:{user}@{contact_ip}:{local_port}>",
                                 "Content-Type": "application/sdp",
                             }
                             offer_dir = dialog.get("offer_dir", "sendrecv") or "sendrecv"
@@ -1881,7 +1887,7 @@ def main():
                                 remote_effective,
                             )
                             sdp = build_sdp(
-                                contact_ip,
+                                sdp_ip,
                                 args.rtp_port,
                                 [
                                     (
@@ -1918,12 +1924,12 @@ def main():
                                     "To": f"{dialog['to_uri']};tag={dialog['local_tag']}",
                                     "Call-ID": dialog["call_id"],
                                     "CSeq": dialog["cseq_hdr"],
-                                    "Contact": f"<sip:{user}@{contact_ip}:{sock.getsockname()[1]}>",
+                                "Contact": f"<sip:{user}@{contact_ip}:{local_port}>",
                                     "Content-Type": "application/sdp",
                                 }
                                 answer_dir = dialog.get("answer_dir", args.sdp_direction)
                                 sdp = build_sdp(
-                                    contact_ip,
+                                    sdp_ip,
                                     args.rtp_port,
                                     [
                                         (
