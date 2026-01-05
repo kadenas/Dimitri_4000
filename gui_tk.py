@@ -156,6 +156,7 @@ class App(tk.Tk):
         self.widgets: dict[str, ttk.Entry] = {}
         # shared SIP manager so dialogs can be controlled from GUI
         self.sm = SIPManager(protocol="udp")
+        self._attach_dialog_callback(self.sm)
         self.load_thread = None
         self.uas_thread = None
         self.uac_active = 0
@@ -466,6 +467,14 @@ class App(tk.Tk):
     def log(self, msg: str):
         self.event_q.put(("log", msg))
 
+    def _attach_dialog_callback(self, sm):
+        def _on_terminated(call_id, reason):
+            self.event_q.put(
+                ("dialog_terminated", {"call_id": call_id, "reason": reason})
+            )
+
+        sm.on_dialog_terminated = _on_terminated
+
     def set_health(self, state: str):
         style = "Status.OK.TLabel" if state == "OK" else "Status.Bad.TLabel"
         self.health_state = state
@@ -521,7 +530,11 @@ class App(tk.Tk):
                     self.bye_all_uac_btn.config(state="normal")
                 except Exception:
                     pass
-            elif kind == "uac_ended":
+            elif kind in {"uac_ended", "dialog_terminated"}:
+                if kind == "dialog_terminated":
+                    reason = (data or {}).get("reason", "")
+                    if reason == "remote_bye":
+                        self.state["uac"]["remote_bye"] += 1
                 self.uac_active = max(0, self.uac_active - 1)
                 if self.uac_active == 0:
                     try:
@@ -1048,6 +1061,7 @@ class App(tk.Tk):
             return
 
         sm = SIPManager(sock=sock, logger=logging.getLogger("gui"))
+        self._attach_dialog_callback(sm)
         self.sm = sm
         self._sm_for_gui = sm
 
@@ -1099,6 +1113,7 @@ class App(tk.Tk):
             return
         sock = self._ensure_shared_sock()
         self.sm = SIPManager(sock=sock)
+        self._attach_dialog_callback(self.sm)
         t = threading.Thread(target=call_worker, args=(cfg, self.event_q, self.sm))
         t.daemon = True
         t.start()
@@ -1115,6 +1130,7 @@ class App(tk.Tk):
             return
         sock = self._ensure_shared_sock()
         self.sm = SIPManager(sock=sock)
+        self._attach_dialog_callback(self.sm)
         self.stop_event.clear()
         t = threading.Thread(target=load_worker, args=(cfg, self.event_q, self.stop_event, self.sm))
         t.daemon = True
@@ -1132,6 +1148,7 @@ class App(tk.Tk):
                 return
             sock = self._ensure_shared_sock()
             sm = SIPManager(sock=sock)
+            self._attach_dialog_callback(sm)
             self.sm = sm
             self._sm_for_gui = sm
             self.uas_stop = threading.Event()

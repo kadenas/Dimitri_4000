@@ -58,6 +58,24 @@ def bracket(uri: str | None) -> str:
     return f"<{clean}>" if clean else ""
 
 
+def get_tag(header: str | None) -> str:
+    """Extract the SIP tag parameter from a header value."""
+    if not header:
+        return ""
+    match = re.search(r";\s*tag=([^;>\s]+)", header, re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def ensure_to_has_tag(to_header: str, expected_tag: str) -> str:
+    """Ensure a To header includes the expected tag parameter."""
+    if not expected_tag:
+        return to_header
+    if "tag=" in (to_header or "").lower():
+        return to_header
+    sep = "" if to_header.strip().endswith(">") else ""
+    return f"{to_header}{sep};tag={expected_tag}"
+
+
 def status_from_response(data: bytes):
     """Devuelve (codigo, razon) a partir de la primera línea SIP."""
     try:
@@ -419,6 +437,7 @@ class Dialog:
     role: str
     dst: tuple[str, int] | None = None
     rtp: RtpSession | None = None
+    state: str = "confirmed"
 
 
 def build_bye_request(
@@ -556,6 +575,7 @@ class SIPManager:
         self.ring_timer: threading.Timer | None = None
         self._current_call: dict | None = None
         self._uac_lock = threading.Lock()
+        self.on_dialog_terminated = None
 
     def _new_cseq(self) -> int:
         """Return a random initial CSeq for new dialogs."""
@@ -1422,31 +1442,14 @@ class SIPManager:
                                         raise
                                     raise
                                 start2, headers2 = parse_headers(data2)
-                                if start2.startswith("BYE") and headers2.get(
-                                    "call-id"
-                                ) == call_id:
-                                    resp = build_response(
-                                        200,
-                                        "OK",
-                                        {
-                                            "Via": headers2.get("via", ""),
-                                            "From": headers2.get("from", ""),
-                                            "To": headers2.get("to", ""),
-                                            "Call-ID": headers2.get("call-id", ""),
-                                            "CSeq": headers2.get("cseq", ""),
-                                        },
-                                    )
-                                    s.send(resp)
-                                    self.logger.info(
-                                        f"RX BYE call_id={call_id} side=UAC -> sending 200 OK & stopping RTP"
-                                    )
-                                    self._safe_stop_rtp(self.uac_dialogs.get(call_id))
-                                    self.uac_dialogs.pop(call_id, None)
+                                if self.handle_uac_bye(data2, sock=s):
                                     result = "remote-bye"
                                     break
                                 c2, _ = status_from_response(data2)
                                 if c2 == 200:
-                                    s.send(ack)
+                                    dialog = self.uac_dialogs.get(call_id)
+                                    if dialog and dialog.state != "terminated":
+                                        s.send(ack)
                                     continue
                                 if start2.startswith("INVITE") or start2.startswith(
                                     "UPDATE"
@@ -1550,6 +1553,58 @@ class SIPManager:
         except Exception:
             pass
 
+    def _reply_200_ok_to_bye(
+        self,
+        headers: dict,
+        *,
+        addr: tuple[str, int] | None = None,
+        sock: socket.socket | None = None,
+        dialog: Dialog | None = None,
+    ) -> None:
+        """Send a 200 OK response for an incoming BYE request."""
+        via = headers.get("via", "")
+        from_h = headers.get("from", "")
+        to_h = headers.get("to", "")
+        if dialog:
+            to_h = ensure_to_has_tag(to_h, dialog.local_tag)
+        call_id = headers.get("call-id", "")
+        cseq = headers.get("cseq", "")
+        resp_headers = {
+            "Via": via,
+            "From": from_h,
+            "To": to_h,
+            "Call-ID": call_id,
+            "CSeq": cseq,
+        }
+        if dialog and dialog.local_contact:
+            resp_headers["Contact"] = bracket(dialog.local_contact)
+        resp_headers["User-Agent"] = "Dimitri-4000/0.1"
+        resp = build_response(200, "OK", resp_headers)
+        target_sock = sock or self.sock
+        if not target_sock:
+            return
+        try:
+            if addr:
+                target_sock.sendto(resp, addr)
+            else:
+                target_sock.send(resp)
+        except Exception:
+            pass
+
+    def _terminate_dialog(self, call_id: str, reason: str = "") -> None:
+        dlg = self.uac_dialogs.get(call_id)
+        if dlg:
+            dlg.state = "terminated"
+        self._clear_ring_timer()
+        if dlg:
+            self._safe_stop_rtp(dlg)
+            self.uac_dialogs.pop(call_id, None)
+        if self.on_dialog_terminated and dlg:
+            try:
+                self.on_dialog_terminated(call_id, reason)
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------
     def handle_uas_bye(self, msg: bytes, addr: tuple[str, int]) -> bool:
         """Handle an incoming BYE request on UAS side.
@@ -1581,6 +1636,36 @@ class SIPManager:
             self._safe_stop_rtp(dlg)
         self.logger.info(
             "UAS: BYE recibido, 200 OK enviado, RTP detenido. call_id=%s",
+            call_id,
+        )
+        return True
+
+    def handle_uac_bye(
+        self,
+        msg: bytes,
+        addr: tuple[str, int] | None = None,
+        sock: socket.socket | None = None,
+    ) -> bool:
+        """Handle an incoming BYE request on UAC side.
+
+        Sends 200 OK, stops RTP for the dialog and removes it from
+        ``uac_dialogs``. Returns ``True`` if a BYE was processed.
+        """
+        start, headers = parse_headers(msg)
+        if not start or not start.startswith("BYE "):
+            return False
+        call_id = headers.get("call-id", "")
+        dlg = self.uac_dialogs.get(call_id)
+        if not dlg:
+            return False
+        from_tag = get_tag(headers.get("from", ""))
+        to_tag = get_tag(headers.get("to", ""))
+        if dlg.remote_tag != from_tag or dlg.local_tag != to_tag:
+            return False
+        self._reply_200_ok_to_bye(headers, addr=addr, sock=sock, dialog=dlg)
+        self._terminate_dialog(call_id, reason="remote_bye")
+        self.logger.info(
+            "UAC: BYE recibido, 200 OK enviado, RTP detenido. call_id=%s",
             call_id,
         )
         return True

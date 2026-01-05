@@ -190,6 +190,9 @@ class RtpSession:
         self.remote_addr = (ip, port)
 
     def stop(self) -> None:
+        if getattr(self, "_stopped", False):
+            return
+        self._stopped = True
         self.running = False
         try:
             for t in [
