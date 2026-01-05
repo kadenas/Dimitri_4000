@@ -40,6 +40,7 @@ from sip_manager import (
     strip_brackets,
 )
 from app import run_load_generator, sanitize_extra_headers
+from socket_handler import get_sip_transport
 
 # Configuration persisted in user home directory
 CONFIG_PATH = os.path.expanduser("~/.dimitri4000.json")
@@ -703,14 +704,11 @@ class App(tk.Tk):
             calls = self._int_or(self.entry_calls.get(), 1)
             dst_host = self.entry_dst_host.get().strip()
             dst_port = self._int_or(self.entry_dst_port.get(), 5060)
-            src_port_base = self._int_or(self.entry_src_port_base.get(), 5062)
-            src_port_step = self._int_or(self.entry_src_port_step.get(), 0)
             rtp_port_step = self._int_or(self.entry_rtp_port_step.get(), 2)
             return (
                 calls >= 1
                 and bool(dst_host)
                 and dst_port > 0
-                and src_port_base > 0
                 and rtp_port_step > 0
             )
         except Exception:
@@ -862,6 +860,7 @@ class App(tk.Tk):
 
         self.options_thread = OptionsMonitorThread(
             sock=sock,
+            sip_ip=getattr(self, "_shared_transport", None).bind_ip if getattr(self, "_shared_transport", None) else None,
             dst_host=dst_host,
             dst_port=dst_port,
             interval=interval,
@@ -1074,7 +1073,7 @@ class App(tk.Tk):
             self.log("UAC: no se pudo importar SIPManager")
             return
 
-        sm = SIPManager(sock=sock, logger=logging.getLogger("gui"))
+        sm = SIPManager(transport=self._shared_transport, logger=logging.getLogger("gui"))
         self._attach_dialog_callback(sm)
         self.sm = sm
         self._sm_for_gui = sm
@@ -1126,7 +1125,7 @@ class App(tk.Tk):
         if not cfg:
             return
         sock = self._ensure_shared_sock()
-        self.sm = SIPManager(sock=sock)
+        self.sm = SIPManager(transport=self._shared_transport)
         self._attach_dialog_callback(self.sm)
         t = threading.Thread(target=call_worker, args=(cfg, self.event_q, self.sm))
         t.daemon = True
@@ -1143,7 +1142,7 @@ class App(tk.Tk):
         if not cfg:
             return
         sock = self._ensure_shared_sock()
-        self.sm = SIPManager(sock=sock)
+        self.sm = SIPManager(transport=self._shared_transport)
         self._attach_dialog_callback(self.sm)
         self.stop_event.clear()
         t = threading.Thread(target=load_worker, args=(cfg, self.event_q, self.stop_event, self.sm))
@@ -1161,7 +1160,7 @@ class App(tk.Tk):
             if not cfg:
                 return
             sock = self._ensure_shared_sock()
-            sm = SIPManager(sock=sock)
+            sm = SIPManager(transport=self._shared_transport)
             self._attach_dialog_callback(sm)
             self.sm = sm
             self._sm_for_gui = sm
@@ -1222,10 +1221,9 @@ class App(tk.Tk):
             )
         except Exception:
             src_port = 0
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((bind_ip, src_port))
-        s.settimeout(2.0)
+        transport = get_sip_transport(bind_ip, src_port)
+        self._shared_transport = transport
+        s = transport.sock
         self._shared_sock = s
         return s
 
@@ -1237,6 +1235,7 @@ class App(tk.Tk):
             except Exception:
                 pass
         self._shared_sock = None
+        self._shared_transport = None
 
     def on_bye_all_uac(self):
         sm = getattr(self, "_sm_for_gui", None)
@@ -1275,6 +1274,7 @@ class OptionsMonitorThread(threading.Thread):
         self,
         *,
         sock,
+        sip_ip: str | None,
         dst_host,
         dst_port,
         interval,
@@ -1297,6 +1297,7 @@ class OptionsMonitorThread(threading.Thread):
         self.last = None
         self.rx = 0
         self.local_ip = None
+        self.sip_ip = sip_ip
         self.extra_headers = list(extra_headers or [])
 
     def run(self):
@@ -1308,17 +1309,20 @@ class OptionsMonitorThread(threading.Thread):
             now = time.monotonic()
             if now >= next_send:
                 local_port = sock.getsockname()[1]
-                try:
-                    tmp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    tmp.connect(self.dst)
-                    self.local_ip = tmp.getsockname()[0]
-                except Exception:
-                    self.local_ip = sock.getsockname()[0]
-                finally:
+                if self.sip_ip:
+                    self.local_ip = self.sip_ip
+                else:
                     try:
-                        tmp.close()
+                        tmp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        tmp.connect(self.dst)
+                        self.local_ip = tmp.getsockname()[0]
                     except Exception:
-                        pass
+                        self.local_ip = sock.getsockname()[0]
+                    finally:
+                        try:
+                            tmp.close()
+                        except Exception:
+                            pass
                 call_id, payload = build_options(
                     self.dst[0],
                     self.local_ip,
@@ -1594,8 +1598,8 @@ def load_worker(cfg, event_q, stop_event, sm):
             from_user="dimitri",
             to_domain_load=cfg.get("to_domain") or cfg.get("dst_host"),
             from_domain_load=cfg.get("from_domain") or (cfg.get("bind_ip") or ""),
-            src_port_base=cfg.get("src_port_base", 0),
-            src_port_step=cfg.get("src_port_step", 10),
+            src_port_base=0,
+            src_port_step=0,
             rtp_port_base=cfg.get("rtp_port_base", 40000),
             rtp_port_step=cfg.get("rtp_port_step", 2),
             bind_ip=cfg.get("bind_ip") or None,
@@ -1631,7 +1635,6 @@ def load_worker(cfg, event_q, stop_event, sm):
             args.calls < 1
             or not args.dst
             or args.dst_port <= 0
-            or args.src_port_base <= 0
             or args.rtp_port_step <= 0
         ):
             event_q.put(("log", "Generador: parámetros inválidos; abortando"))
@@ -1647,7 +1650,7 @@ def load_worker(cfg, event_q, stop_event, sm):
             event_q.put(("uac", snapshot))
 
     try:
-        run_load_generator(args, sm, stats_cb=stats_cb)
+        run_load_generator(args, sm, sm.transport, stats_cb=stats_cb)
     except Exception as exc:  # noqa: BLE001
         event_q.put(("log", f"Generador: abortado ({exc})"))
         return
@@ -1669,6 +1672,7 @@ def uas_worker(cfg, event_q, stop_event, sm):
     if not codecs:
         codecs = [(0, "PCMU"), (8, "PCMA")]
     local_ip = sock.getsockname()[0]
+    sip_ip = (cfg.get("bind_ip") or local_ip).strip() if cfg.get("bind_ip") else local_ip
     rtp_port = int(cfg.get("rtp_port_base", "40000"))
     try:
         tone_hz = int(cfg.get("tone_hz", "0"))
@@ -1777,7 +1781,7 @@ def uas_worker(cfg, event_q, stop_event, sm):
                 headers200 = headers_base.copy()
                 headers200.update(
                     {
-                        "Contact": f"<sip:dimitri@{local_ip}:{sock.getsockname()[1]}>",
+                        "Contact": f"<sip:dimitri@{sip_ip}:{sock.getsockname()[1]}>",
                         "Allow": "INVITE, ACK, CANCEL, OPTIONS, BYE",
                         "Accept": "application/sdp",
                         "Content-Type": "application/sdp",

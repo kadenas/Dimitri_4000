@@ -11,6 +11,7 @@ import random
 import string
 from dataclasses import dataclass
 from typing import Dict, Tuple
+from socket_handler import SipTransport
 from rtp import RtpSession
 from sdp import (
     build_sdp,
@@ -547,13 +548,22 @@ class SIPManager:
         self,
         protocol: str = "udp",
         sock: socket.socket | None = None,
+        transport: SipTransport | None = None,
         bind_ip: str = "0.0.0.0",
         src_port: int = 0,
         logger: logging.Logger | None = None,
     ):
         self.protocol = protocol
         self.logger = logger or logging.getLogger("socket_handler")
-        if sock is None:
+        self.transport = transport
+        self.sip_bind_ip: str | None = None
+        self.sip_src_port: int | None = None
+        if transport is not None:
+            sock = transport.sock
+            self.sip_bind_ip = transport.bind_ip
+            self.sip_src_port = transport.src_port
+            self._own_sock = False
+        elif sock is None:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             if src_port:
                 sock.bind((bind_ip, src_port))
@@ -600,6 +610,11 @@ class SIPManager:
             except Exception:
                 pass
         return ip, port
+
+    def _sip_ip_port(self, fallback_ip: str, fallback_port: int) -> tuple[str, int]:
+        sip_ip = self.sip_bind_ip if self.sip_bind_ip not in (None, "") else fallback_ip
+        sip_port = self.sip_src_port if self.sip_src_port else fallback_port
+        return sip_ip, sip_port
 
     def _open_connected_udp(
         self,
@@ -727,7 +742,10 @@ class SIPManager:
             ctx["contact_user"],
         )
         try:
-            ctx["sock"].send(cancel)
+            if self.transport:
+                ctx["sock"].sendto(cancel, (ctx["dst_host"], ctx["dst_port"]))
+            else:
+                ctx["sock"].send(cancel)
         except OSError as e:
             if getattr(e, "errno", None) == errno.ECONNREFUSED:
                 logger.error(
@@ -788,19 +806,21 @@ class SIPManager:
 
         self._uac_lock.acquire()
         self._reset_call_state()
+        use_transport = self.transport is not None
         owned_socket = False
         prev_timeout = None
         if self.sock:
             s = self.sock
             prev_timeout = s.gettimeout()
-            try:
-                s.connect((dst_host, dst_port))
-            except OSError as e:
-                if getattr(e, "errno", None) == errno.ECONNREFUSED:
-                    logger.error(
-                        f"Destino no escucha en {dst_host}:{dst_port}"
-                    )
-                raise
+            if not use_transport:
+                try:
+                    s.connect((dst_host, dst_port))
+                except OSError as e:
+                    if getattr(e, "errno", None) == errno.ECONNREFUSED:
+                        logger.error(
+                            f"Destino no escucha en {dst_host}:{dst_port}"
+                        )
+                    raise
             local_ip, local_port = self._local_ip_port(s, dst_host, dst_port)
             s.settimeout(0.5)
         else:
@@ -810,6 +830,15 @@ class SIPManager:
             local_ip, local_port = self._local_ip_port(s, dst_host, dst_port)
             s.settimeout(0.5)
             owned_socket = True
+        sip_ip, sip_port = self._sip_ip_port(local_ip, local_port)
+        current_dst = (dst_host, dst_port)
+
+        def send_data(payload: bytes, dst: tuple[str, int] | None = None) -> None:
+            target = dst or current_dst
+            if use_transport:
+                s.sendto(payload, target)
+            else:
+                s.send(payload)
 
         if from_uri:
             if not from_uri.startswith("sip:"):
@@ -892,8 +921,8 @@ class SIPManager:
             request_uri,
             from_uri,
             to_uri,
-            local_ip,
-            local_port,
+            sip_ip,
+            sip_port,
             call_id,
             invite_cseq,
             tag,
@@ -911,8 +940,8 @@ class SIPManager:
             "sock": s,
             "request_uri": request_uri,
             "to_uri": to_uri,
-            "local_ip": local_ip,
-            "local_port": local_port,
+            "local_ip": sip_ip,
+            "local_port": sip_port,
             "from_uri": from_uri,
             "from_display": from_display,
             "call_id": call_id,
@@ -928,10 +957,10 @@ class SIPManager:
         self.cancel_requested = False
 
         logger.info(
-            f"Enviando INVITE (CSeq={invite_cseq}) a {dst_host}:{dst_port} sent-by={local_ip}:{local_port}"
+            f"Enviando INVITE (CSeq={invite_cseq}) a {dst_host}:{dst_port} sent-by={sip_ip}:{sip_port}"
         )
         try:
-            s.send(invite)
+            send_data(invite)
         except OSError as e:
             if getattr(e, "errno", None) == errno.ECONNREFUSED:
                 logger.error(
@@ -954,7 +983,7 @@ class SIPManager:
         got_provisional = False
         
         def send_bye(cseq: int) -> int:
-            nonlocal to_header, remote_target
+            nonlocal to_header, remote_target, current_dst
             auth_hdr = None
             if auth_user and auth_pass and auth_state.get("nonce"):
                 cnonce = secrets.token_hex(8)
@@ -982,15 +1011,18 @@ class SIPManager:
                 try:
                     _, h, p = _contact_uri_host_port(send_uri)
                     if p is None:
-                        p = s.getpeername()[1]
-                    s.connect((h, p))
+                        p = current_dst[1]
+                    if use_transport:
+                        current_dst = (h, p)
+                    else:
+                        s.connect((h, p))
                 except Exception:
                     pass
             bye = build_uac_bye_request(
                 remote_target,
                 to_header,
-                local_ip,
-                local_port,
+                sip_ip,
+                sip_port,
                 from_uri,
                 from_display,
                 call_id,
@@ -1000,10 +1032,13 @@ class SIPManager:
                 auth_header=auth_hdr,
                 route_set=route_set,
             )
-            s.send(bye)
+            send_data(bye, current_dst)
             while True:
                 try:
-                    data2 = s.recv(4096)
+                    if use_transport:
+                        data2, _ = s.recvfrom(4096)
+                    else:
+                        data2 = s.recv(4096)
                 except socket.timeout:
                     return cseq
                 except OSError as e:
@@ -1014,6 +1049,8 @@ class SIPManager:
                         return cseq
                     raise
                 start2, headers2 = parse_headers(data2)
+                if use_transport and headers2.get("call-id") != call_id:
+                    continue
                 c2, _ = status_from_response(data2)
                 if c2 in (401, 407) and auth_user and auth_pass and not auth_state.get("bye_auth_done"):
                     chall = headers2.get("www-authenticate" if c2 == 401 else "proxy-authenticate")
@@ -1029,8 +1066,8 @@ class SIPManager:
                         ack = build_ack(
                             remote_target,
                             to_hdr,
-                            local_ip,
-                            local_port,
+                            sip_ip,
+                            sip_port,
                             from_uri,
                             from_display,
                             call_id,
@@ -1038,7 +1075,7 @@ class SIPManager:
                             tag,
                             contact_user,
                         )
-                        s.send(ack)
+                        send_data(ack, current_dst)
                         cseq += 1
                         cnonce = secrets.token_hex(8)
                         auth_state["nc"] = auth_state.get("nc", 0) + 1
@@ -1058,8 +1095,8 @@ class SIPManager:
                         bye = build_uac_bye_request(
                             remote_target,
                             to_hdr,
-                            local_ip,
-                            local_port,
+                            sip_ip,
+                            sip_port,
                             from_uri,
                             from_display,
                             call_id,
@@ -1069,7 +1106,7 @@ class SIPManager:
                             auth_header=(hdr_name, auth_val),
                             route_set=route_set,
                         )
-                        s.send(bye)
+                        send_data(bye, current_dst)
                         auth_state["bye_auth_done"] = True
                         continue
                 if c2 == 200:
@@ -1111,7 +1148,10 @@ class SIPManager:
                     break
 
                 try:
-                    data = s.recv(4096)
+                    if use_transport:
+                        data, _ = s.recvfrom(4096)
+                    else:
+                        data = s.recv(4096)
                 except socket.timeout:
                     now = time.monotonic()
                     if (
@@ -1121,7 +1161,7 @@ class SIPManager:
                         and retries < MAX_RETX
                     ):
                         try:
-                            s.send(invite)
+                            send_data(invite)
                         except OSError as e:
                             if getattr(e, "errno", None) == errno.ECONNREFUSED:
                                 logger.error(
@@ -1148,6 +1188,8 @@ class SIPManager:
 
                 code, reason = status_from_response(data)
                 start, headers = parse_headers(data)
+                if use_transport and headers.get("call-id") != call_id:
+                    continue
                 cseq_hdr = headers.get("cseq", "")
                 if code is not None and 100 <= code < 200:
                     got_provisional = True
@@ -1163,8 +1205,8 @@ class SIPManager:
                         ack = build_ack(
                             request_uri,
                             to_header,
-                            local_ip,
-                            local_port,
+                            sip_ip,
+                            sip_port,
                             from_uri,
                             from_display,
                             call_id,
@@ -1172,7 +1214,7 @@ class SIPManager:
                             tag,
                             contact_user,
                         )
-                        s.send(ack)
+                        send_data(ack)
                         self._clear_ring_timer()
                         self.failed = True
                         setup_ms = int((time.monotonic() - t_start) * 1000)
@@ -1198,8 +1240,8 @@ class SIPManager:
                         ack = build_ack(
                             request_uri,
                             to_header,
-                            local_ip,
-                            local_port,
+                            sip_ip,
+                            sip_port,
                             from_uri,
                             from_display,
                             call_id,
@@ -1207,7 +1249,7 @@ class SIPManager:
                             tag,
                             contact_user,
                         )
-                        s.send(ack)
+                        send_data(ack)
                         invite_cseq += 1
                         cnonce = secrets.token_hex(8)
                         auth_state["nc"] = auth_state.get("nc", 0) + 1
@@ -1229,8 +1271,8 @@ class SIPManager:
                             request_uri,
                             from_uri,
                             to_uri,
-                            local_ip,
-                            local_port,
+                            sip_ip,
+                            sip_port,
                             call_id,
                             invite_cseq,
                             tag,
@@ -1254,7 +1296,7 @@ class SIPManager:
                         )
                         logger.info("Reenviando INVITE con autenticacion Digest")
                         try:
-                            s.send(invite)
+                            send_data(invite)
                         except OSError as e:
                             if getattr(e, "errno", None) == errno.ECONNREFUSED:
                                 logger.error(
@@ -1318,10 +1360,7 @@ class SIPManager:
                     if contact:
                         remote_target, host, port = _contact_uri_host_port(contact)
                         if port is None:
-                            try:
-                                port = s.getpeername()[1]
-                            except OSError:
-                                port = 5060
+                            port = current_dst[1] if current_dst else 5060
                             if "@" in remote_target:
                                 user_part, host_part = remote_target.split("@", 1)
                                 if ";" in host_part:
@@ -1332,18 +1371,21 @@ class SIPManager:
                             elif remote_target.startswith("sip:"):
                                 host_only = remote_target[4:]
                                 remote_target = f"sip:{host_only}:{port}"
-                        try:
-                            s.connect((host, port))
-                        except OSError:
-                            pass
+                        if use_transport:
+                            current_dst = (host, port)
+                        else:
+                            try:
+                                s.connect((host, port))
+                            except OSError:
+                                pass
                     rr = headers.get("record-route")
                     if rr:
                         route_set = _route_set_from_record_route(rr)
                     ack = build_ack(
                         remote_target,
                         to_header,
-                        local_ip,
-                        local_port,
+                        sip_ip,
+                        sip_port,
                         from_uri,
                         from_display,
                         call_id,
@@ -1356,7 +1398,7 @@ class SIPManager:
                     ctx = self._current_call or {}
                     ctx["remote_target"] = remote_target
                     ctx["to_header"] = to_header
-                    s.send(ack)
+                    send_data(ack, current_dst)
                     if negotiated_pt is None:
                         logger.warning(
                             "unsupported negotiated codec pts=%s local=%s",
@@ -1407,12 +1449,12 @@ class SIPManager:
                         remote_tag=remote_tag,
                         route_set=route_set.copy(),
                         remote_target=remote_target,
-                        local_contact=f"sip:{contact_user}@{local_ip}:{local_port}",
+                        local_contact=f"sip:{contact_user}@{sip_ip}:{sip_port}",
                         cseq_local=invite_cseq,
                         cseq_remote=remote_cseq,
                         sock=s,
-                        local_ip=local_ip,
-                        local_port=local_port,
+                        local_ip=sip_ip,
+                        local_port=sip_port,
                         role="uac",
                         dst=(dst_host, dst_port),
                         rtp=rtp,
@@ -1430,7 +1472,11 @@ class SIPManager:
                                     result = "max-time-bye"
                                     break
                                 try:
-                                    data2 = s.recv(4096)
+                                    if use_transport:
+                                        data2, addr2 = s.recvfrom(4096)
+                                    else:
+                                        data2 = s.recv(4096)
+                                        addr2 = None
                                 except socket.timeout:
                                     continue
                                 except OSError as e:
@@ -1441,14 +1487,16 @@ class SIPManager:
                                         raise
                                     raise
                                 start2, headers2 = parse_headers(data2)
-                                if self.handle_uac_bye(data2, sock=s):
+                                if use_transport and headers2.get("call-id") != call_id:
+                                    continue
+                                if self.handle_uac_bye(data2, addr=addr2, sock=s):
                                     result = "remote-bye"
                                     break
                                 c2, _ = status_from_response(data2)
                                 if c2 == 200:
                                     dialog = self.uac_dialogs.get(call_id)
                                     if dialog and dialog.state != "terminated":
-                                        s.send(ack)
+                                        send_data(ack, current_dst)
                                     continue
                                 if start2.startswith("INVITE") or start2.startswith(
                                     "UPDATE"
@@ -1469,8 +1517,8 @@ class SIPManager:
                     ack = build_ack(
                         request_uri,
                         to_header,
-                        local_ip,
-                        local_port,
+                        sip_ip,
+                        sip_port,
                         from_uri,
                         from_display,
                         call_id,
@@ -1478,7 +1526,7 @@ class SIPManager:
                         tag,
                         contact_user,
                     )
-                    s.send(ack)
+                    send_data(ack)
                     setup_ms = int((time.monotonic() - t_start) * 1000)
                     result = "canceled"
                     break
@@ -1488,8 +1536,8 @@ class SIPManager:
                     ack = build_ack(
                         request_uri,
                         to_header,
-                        local_ip,
-                        local_port,
+                        sip_ip,
+                        sip_port,
                         from_uri,
                         from_display,
                         call_id,
@@ -1497,7 +1545,7 @@ class SIPManager:
                         tag,
                         contact_user,
                     )
-                    s.send(ack)
+                    send_data(ack)
                     self._clear_ring_timer()
                     self.failed = True
                     setup_ms = int((time.monotonic() - t_start) * 1000)
@@ -1525,7 +1573,8 @@ class SIPManager:
                     try:
                         if prev_timeout is not None:
                             s.settimeout(prev_timeout)
-                        s.connect(("0.0.0.0", 0))
+                        if not use_transport:
+                            s.connect(("0.0.0.0", 0))
                     except OSError:
                         pass
                 if 'rtp' in locals():
@@ -1695,8 +1744,11 @@ class SIPManager:
                         dst = dlg.dst
                         if not dst:
                             continue
-                        src_ip, src_port = self._local_ip_port(
+                        fallback_ip, fallback_port = self._local_ip_port(
                             self.sock, dst[0], dst[1]
+                        )
+                        src_ip, src_port = self._sip_ip_port(
+                            fallback_ip, fallback_port
                         )
                         bye_text = build_bye_request(
                             dlg, src_ip, src_port, transport=self.protocol.upper()
@@ -1711,8 +1763,11 @@ class SIPManager:
                         )
                         self.sock.sendto(bye_text.encode(), dst)
                     else:
-                        src_ip, src_port = self._local_ip_port(
+                        fallback_ip, fallback_port = self._local_ip_port(
                             self.sock, dlg["dst"][0], dlg["dst"][1]
+                        )
+                        src_ip, src_port = self._sip_ip_port(
+                            fallback_ip, fallback_port
                         )
                         bye = build_bye(dlg)
                         self.logger.info(
@@ -1736,10 +1791,15 @@ class SIPManager:
         for key, dlg in list(dialogs.items()):
             dst = getattr(dlg, "dst", None)
             try:
-                if dst and dlg.sock:
-                    src_ip, src_port = self._local_ip_port(dlg.sock, dst[0], dst[1])
-                else:
-                    src_ip, src_port = dlg.local_ip, dlg.local_port
+            if dst and dlg.sock:
+                fallback_ip, fallback_port = self._local_ip_port(
+                    dlg.sock, dst[0], dst[1]
+                )
+                src_ip, src_port = self._sip_ip_port(
+                    fallback_ip, fallback_port
+                )
+            else:
+                src_ip, src_port = dlg.local_ip, dlg.local_port
                 bye_text = build_bye_request(
                     dlg, src_ip, src_port, transport=self.protocol.upper()
                 )
