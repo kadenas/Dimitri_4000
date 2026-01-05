@@ -53,6 +53,93 @@ from core.options_monitor import OptionsMonitor, register_options_responder
 PROHIBITED = {"via", "from", "to", "call-id", "cseq", "contact", "content-length"}
 
 
+class SIPDialog:
+    def __init__(self, call_id, local_tag, remote_tag=None):
+        self.call_id = call_id
+        self.local_tag = local_tag
+        self.remote_tag = remote_tag
+        self.cseq = 1
+        self.ack_sent = False
+        self.established = False
+        self.rtp = None
+        self.remote_rtp = None  # (ip, port)
+        self.timer_cancel = None
+        self.extra_headers = []
+
+
+def build_identities(args):
+    # Normaliza variables para construir URIs y cabeceras
+    from_user = getattr(args, "from_user", None)
+    to_user = getattr(args, "to_user", None)
+    from_domain = getattr(args, "from_domain", None)
+    to_domain = getattr(args, "to_domain", None)
+
+    from_uri = getattr(args, "from_uri", None) or (
+        f"sip:{from_user}@{from_domain}" if from_user and from_domain else None
+    )
+    to_uri = getattr(args, "to_uri", None) or (
+        f"sip:{to_user}@{to_domain}" if to_user and to_domain else None
+    )
+
+    extra_headers = []
+    raw = getattr(args, "extra_headers", "") or ""
+    for line in str(raw).splitlines():
+        h = line.strip()
+        if h:
+            extra_headers.append(h)
+
+    return from_uri, to_uri, extra_headers
+
+
+def start_rtp_for_dialog(
+    dialog: SIPDialog,
+    local_ip,
+    rtp_port,
+    payload_pt,
+    tone_hz,
+    send_silence,
+    remote_ip,
+    remote_port,
+):
+    dialog.remote_rtp = (remote_ip, remote_port)
+    dialog.rtp = RtpSession(
+        local_ip,
+        rtp_port,
+        payload_pt,
+        forced=True,
+    )
+    dialog.rtp.tone_hz = tone_hz
+    dialog.rtp.send_silence = send_silence and not tone_hz
+    dialog.rtp.start(remote_ip, remote_port)
+
+
+def stop_rtp_for_dialog(dialog: SIPDialog):
+    if dialog and dialog.rtp:
+        try:
+            dialog.rtp.stop()
+        except Exception:
+            pass
+        dialog.rtp = None
+
+
+def schedule_cancel_if_ringing(sock, dst, dialog: SIPDialog, timeout_s, send_cancel_fn):
+    def _t():
+        if not dialog.established:
+            send_cancel_fn(sock, dst, dialog)
+
+    dialog.timer_cancel = threading.Timer(timeout_s, _t)
+    dialog.timer_cancel.start()
+
+
+def clear_cancel_timer(dialog: SIPDialog):
+    if dialog and dialog.timer_cancel:
+        try:
+            dialog.timer_cancel.cancel()
+        except Exception:
+            pass
+        dialog.timer_cancel = None
+
+
 def sanitize_extra_headers(raw, *, log=None) -> list[str]:
     """Return sanitized SIP headers ignoring protected ones."""
 
@@ -486,6 +573,51 @@ def parse_args():
     return args
 
 
+def make_per_call_args(
+    base,
+    i,
+    fixed_numbers=False,
+    num_step=1,
+    src_port_base=None,
+    src_port_step=0,
+    rtp_port_base=None,
+    rtp_port_step=2,
+):
+    from types import SimpleNamespace
+
+    a = SimpleNamespace(**vars(base))  # copia superficial
+
+    # Numeración
+    if fixed_numbers:
+        a.from_user = base.from_user
+        a.to_user = base.to_user
+    else:
+        if hasattr(base, "from_user_start"):
+            a.from_user = str(int(base.from_user_start) + i * num_step).zfill(
+                int(getattr(base, "pad_width", 0) or 0)
+            )
+        if hasattr(base, "to_user_start"):
+            a.to_user = str(int(base.to_user_start) + i * num_step).zfill(
+                int(getattr(base, "pad_width", 0) or 0)
+            )
+
+    # Puertos
+    if src_port_base:
+        a.src_port = int(src_port_base) + i * int(src_port_step or 0)
+    if rtp_port_base:
+        a.rtp_port = int(rtp_port_base) + i * int(rtp_port_step or 2)
+
+    # Defaults robustos
+    if not hasattr(a, "extra_headers"):
+        a.extra_headers = ""
+    if not hasattr(a, "rtp_send_silence"):
+        a.rtp_send_silence = False
+
+    # Reconstruye URIs y cabeceras
+    a.from_uri, a.to_uri, a.extra_headers_list = build_identities(a)
+    return a
+
+
 def run_load_generator(args, sip_manager, stats_cb=None):
     """Generate many calls with controlled rate and incremental parameters.
 
@@ -539,8 +671,18 @@ def run_load_generator(args, sip_manager, stats_cb=None):
 
     to_start = int(args.to_number_start or 0)
     from_start = int(args.from_number_start or 0)
+    args.from_user_start = args.from_number_start
+    args.to_user_start = args.to_number_start
+    args.from_user = getattr(args, "from_user", None) or getattr(args, "from_number", None)
+    args.to_user = getattr(args, "to_user", None) or getattr(args, "to_number", None)
+    args.from_domain = getattr(args, "from_domain_load", None)
+    args.to_domain = getattr(args, "to_domain_load", None)
 
-    base_extra_headers = _parse_extra_headers(getattr(args, "extra_headers", None), log=logger)
+    base_extra_headers = _parse_extra_headers(
+        getattr(args, "extra_headers_list", None)
+        or getattr(args, "extra_headers", None),
+        log=logger,
+    )
     if not base_extra_headers:
         base_extra_headers = _parse_extra_headers(
             getattr(args, "extra_headers_text", None),
@@ -583,30 +725,46 @@ def run_load_generator(args, sip_manager, stats_cb=None):
 
     def worker(i):
         nonlocal counters
+        call_args = make_per_call_args(
+            args,
+            i,
+            fixed_numbers=fixed_numbers,
+            num_step=step,
+            src_port_base=args.src_port_base,
+            src_port_step=args.src_port_step,
+            rtp_port_base=args.rtp_port_base,
+            rtp_port_step=args.rtp_port_step,
+        )
         if fixed_numbers:
             num_to = format_num(to_start)
+            num_from = format_num(from_start) if args.from_number_start else None
         else:
             num_to = format_num(to_start + i * step)
+            num_from = (
+                format_num(from_start + i * step) if args.from_number_start else None
+            )
+        call_args.to_user = num_to
+        if num_from is not None:
+            call_args.from_user = num_from
         if args.to_uri_pattern:
-            to_uri = args.to_uri_pattern.format(num=num_to, host=args.to_domain_load)
-            to_number = None
-        else:
-            to_uri = None
-            to_number = num_to
-        if args.from_number_start:
-            if fixed_numbers:
-                num_from = format_num(from_start)
-            else:
-                num_from = format_num(from_start + i * step)
-        else:
-            num_from = args.from_number or args.from_user
-        from_user = num_from
-        from_domain = args.from_domain_load
-        to_user = to_number
-        to_domain = args.to_domain_load
+            call_args.to_uri = args.to_uri_pattern.format(
+                num=call_args.to_user,
+                host=args.to_domain_load,
+            )
+        call_args.from_uri, call_args.to_uri, call_args.extra_headers_list = build_identities(
+            call_args
+        )
 
-        from_uri = _norm_sip_uri(from_user, from_domain, getattr(args, "from_uri", None))
-        final_to_uri = _norm_sip_uri(to_user, to_domain, to_uri)
+        from_uri = _norm_sip_uri(
+            call_args.from_user,
+            call_args.from_domain,
+            getattr(call_args, "from_uri", None),
+        )
+        final_to_uri = _norm_sip_uri(
+            call_args.to_user,
+            call_args.to_domain,
+            getattr(call_args, "to_uri", None),
+        )
         try:
             from_uri = _require(from_uri, "from_uri", logger)
             final_to_uri = _require(final_to_uri, "to_uri", logger)
@@ -616,8 +774,8 @@ def run_load_generator(args, sip_manager, stats_cb=None):
                 active.discard(threading.current_thread())
             return
 
-        src_port = args.src_port_base + i * args.src_port_step if args.src_port_base else 0
-        rtp_port = args.rtp_port_base + i * args.rtp_port_step
+        src_port = getattr(call_args, "src_port", 0) if args.src_port_base else 0
+        rtp_port = getattr(call_args, "rtp_port", args.rtp_port_base)
         if rtp_port % 2:
             rtp_port += 1
         ts = datetime.now(UTC).isoformat()
@@ -648,7 +806,7 @@ def run_load_generator(args, sip_manager, stats_cb=None):
                     send_silence=send_silence,
                     symmetric=args.symmetric_rtp,
                     stats_interval=args.rtp_stats_every,
-                    extra_headers=base_extra_headers,
+                    extra_headers=call_args.extra_headers_list or base_extra_headers,
                     sdp_direction=sdp_direction,
                     sdp_media_extras=sdp_media_extras,
                     sdp_session_extras=sdp_session_extras,
@@ -872,6 +1030,11 @@ def main():
         if not to_uri and args.to:
             to_uri = args.to if args.to.startswith("sip:") else f"sip:{args.to}"
         sm = SIPManager(protocol=args.protocol)
+        extra_headers = (
+            getattr(args, "extra_headers_list", None)
+            or getattr(args, "extra_headers", [])
+            or []
+        )
         try:
             call_id, result, setup_ms, talk_s = sm.place_call(
                 dst_host=dst,
@@ -910,7 +1073,7 @@ def main():
                 symmetric=args.symmetric_rtp,
                 save_wav=args.rtp_save_wav,
                 stats_interval=args.rtp_stats_every,
-                extra_headers=args.extra_headers,
+                extra_headers=extra_headers,
                 sdp_direction=args.sdp_direction,
                 sdp_media_extras=args.sdp_extras,
                 sdp_session_extras=args.sdp_session_extras,
@@ -1526,7 +1689,11 @@ def main():
                     bind_ip=args.bind_ip,
                     bind_port=args.src_port,
                     cseq=cseq,
-                    extra_headers=args.extra_headers,
+                    extra_headers=(
+                        getattr(args, "extra_headers_list", None)
+                        or getattr(args, "extra_headers", [])
+                        or []
+                    ),
                 )
             except OSError as e:
                 logger.error(

@@ -701,14 +701,13 @@ class App(tk.Tk):
             dst_host = self.entry_dst_host.get().strip()
             dst_port = self._int_or(self.entry_dst_port.get(), 5060)
             src_port_base = self._int_or(self.entry_src_port_base.get(), 5062)
-            src_port_step = self._int_or(self.entry_src_port_step.get(), 10)
+            src_port_step = self._int_or(self.entry_src_port_step.get(), 0)
             rtp_port_step = self._int_or(self.entry_rtp_port_step.get(), 2)
             return (
                 calls >= 1
                 and bool(dst_host)
                 and dst_port > 0
                 and src_port_base > 0
-                and src_port_step > 0
                 and rtp_port_step > 0
             )
         except Exception:
@@ -794,7 +793,7 @@ class App(tk.Tk):
         cfg["number_step"] = self._int_or(self.entry_number_step.get(), 1)
         cfg["pad_width"] = self._int_or(self.entry_pad_width.get(), 0)
         cfg["src_port_base"] = self._int_or(self.entry_src_port_base.get(), 5062)
-        cfg["src_port_step"] = self._int_or(self.entry_src_port_step.get(), 10)
+        cfg["src_port_step"] = self._int_or(self.entry_src_port_step.get(), 0)
         cfg["rtp_port_step"] = self._int_or(self.entry_rtp_port_step.get(), 2)
         if cfg["number_step"] < 1:
             cfg["number_step"] = 1
@@ -956,6 +955,14 @@ class App(tk.Tk):
         self._uac_running = True
         try:
             self.call_btn.configure(state="disabled")
+        except Exception:
+            pass
+        try:
+            self.bye_uac_btn.configure(state="normal")
+        except Exception:
+            pass
+        try:
+            self.bye_uas_btn.configure(state="normal")
         except Exception:
             pass
         t = threading.Thread(target=self._uac_worker, daemon=True)
@@ -1616,7 +1623,6 @@ def load_worker(cfg, event_q, stop_event, sm):
             or not args.dst
             or args.dst_port <= 0
             or args.src_port_base <= 0
-            or args.src_port_step <= 0
             or args.rtp_port_step <= 0
         ):
             event_q.put(("log", "Generador: parámetros inválidos; abortando"))

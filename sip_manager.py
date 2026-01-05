@@ -1356,8 +1356,8 @@ class SIPManager:
                     ctx = self._current_call or {}
                     ctx["remote_target"] = remote_target
                     ctx["to_header"] = to_header
+                    s.send(ack)
                     if negotiated_pt is None:
-                        s.send(ack)
                         logger.warning(
                             "unsupported negotiated codec pts=%s local=%s",
                             pts,
@@ -1384,7 +1384,6 @@ class SIPManager:
                         "Starting RTP to %s:%s", remote_ip, remote_port
                     )
                     rtp.start(remote_ip, remote_port)
-                    s.send(ack)
                     call_established = True
                     if self.cancel_requested:
                         invite_cseq = send_bye(invite_cseq + 1)
