@@ -72,6 +72,7 @@ DEFAULT_CONFIG = {
     "auth_pass": "",
     "extra_headers": "",
     "sdp_direction": "sendrecv",
+    "sdp_mode": "sendrecv",
     "sdp_extra_lines": "",
     "sdp_extra_session": False,
     "use_auth": False,
@@ -91,6 +92,7 @@ DEFAULT_CONFIG = {
     "rtp_port_step": "2",
     "ignore_health": False,
     "fixed_numbers": False,
+    "use_fixed_numbers": False,
 }
 
 
@@ -370,7 +372,8 @@ class App(tk.Tk):
         self._add_entry(lf_load, "rtp_port_step", 10, cfg)
         self.entry_rtp_port_step = self.widgets["rtp_port_step"]
         self._add_check(lf_load, "ignore_health", 11, cfg, text="ignorar health")
-        self.var_fixed_numbers = tk.BooleanVar(value=bool(cfg.get("fixed_numbers", False)))
+        fixed_numbers_cfg = cfg.get("use_fixed_numbers", cfg.get("fixed_numbers", False))
+        self.var_fixed_numbers = tk.BooleanVar(value=bool(fixed_numbers_cfg))
         ttk.Checkbutton(
             lf_load,
             text="usar números fijos",
@@ -779,6 +782,8 @@ class App(tk.Tk):
             return None
         cfg["extra_headers"] = self.txt_extra_headers.get("1.0", "end").strip()
         cfg["sdp_extra_lines"] = self.txt_sdp_extra.get("1.0", "end").strip()
+        if "sdp_direction" in cfg:
+            cfg["sdp_mode"] = cfg["sdp_direction"]
         return cfg
 
     def _get_load_cfg(self):
@@ -799,7 +804,9 @@ class App(tk.Tk):
             cfg["number_step"] = 1
             if "number_step" in self.vars:
                 self.vars["number_step"].set("1")
-        cfg["fixed_numbers"] = bool(self.var_fixed_numbers.get())
+        fixed_numbers = bool(self.var_fixed_numbers.get())
+        cfg["fixed_numbers"] = fixed_numbers
+        cfg["use_fixed_numbers"] = fixed_numbers
         return cfg
 
     def start_options_monitor(self):
@@ -1566,7 +1573,7 @@ def load_worker(cfg, event_q, stop_event, sm):
         else:
             media_extras = sdp_lines
             session_extras = []
-        sdp_dir = (cfg.get("sdp_direction") or "sendrecv").lower()
+        sdp_dir = (cfg.get("sdp_direction") or cfg.get("sdp_mode") or "sendrecv").lower()
         if sdp_dir not in DIRECTION_SET:
             logging.getLogger("gui").warning(
                 "Dirección SDP inválida '%s' en config; usando sendrecv",
@@ -1607,9 +1614,11 @@ def load_worker(cfg, event_q, stop_event, sm):
             rate=cfg.get("rate", 1.0),
             max_active=cfg.get("max_active", 1),
             fixed_numbers=bool(cfg.get("fixed_numbers", False)),
+            use_fixed_numbers=bool(cfg.get("use_fixed_numbers", cfg.get("fixed_numbers", False))),
             extra_headers=extra_headers,
             extra_headers_text=extra_headers_text,
             sdp_direction=sdp_dir,
+            sdp_mode=sdp_dir,
             sdp_extras=media_extras,
             sdp_session_extras=session_extras,
         )

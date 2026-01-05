@@ -1,5 +1,6 @@
 import argparse
 import csv
+import logging
 import os
 import select
 import socket
@@ -8,6 +9,7 @@ import uuid
 import sys
 import errno
 import threading
+import secrets
 from datetime import datetime, UTC
 
 # logging básico por si no existe logging_conf en tu repo
@@ -26,6 +28,8 @@ from sip_manager import (
     SIPManager,
     build_options,
     build_response,
+    build_invite,
+    build_ack,
     build_bye,
     parse_headers,
     status_from_response,
@@ -54,17 +58,48 @@ PROHIBITED = {"via", "from", "to", "call-id", "cseq", "contact", "content-length
 
 
 class SIPDialog:
-    def __init__(self, call_id, local_tag, remote_tag=None):
+    def __init__(self, call_id, local_tag):
         self.call_id = call_id
         self.local_tag = local_tag
-        self.remote_tag = remote_tag
+        self.remote_tag = None
         self.cseq = 1
-        self.ack_sent = False
         self.established = False
+        self.ack_sent = False
         self.rtp = None
         self.remote_rtp = None  # (ip, port)
+        self.mode = "sendrecv"  # a=sendrecv|sendonly|recvonly|inactive
         self.timer_cancel = None
         self.extra_headers = []
+        self.branch = None
+
+
+def parse_sdp_for_audio(sdp_text):
+    # devuelve (ip, port, payloads[], mode)
+    ip = None
+    port = None
+    pts = []
+    mode = "sendrecv"
+    for line in sdp_text.splitlines():
+        line = line.strip()
+        if line.startswith("c="):
+            parts = line.split()
+            if len(parts) >= 3:
+                ip = parts[-1]
+        elif line.startswith("m=audio"):
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    port = int(parts[1])
+                except ValueError:
+                    port = None
+                pts = [int(p) for p in parts[3:] if p.isdigit()]
+        elif line == "a=sendonly":
+            mode = "sendonly"
+        elif line == "a=recvonly":
+            mode = "recvonly"
+        elif line == "a=inactive":
+            mode = "inactive"
+    return ip, port, pts, mode
 
 
 def build_identities(args):
@@ -102,14 +137,16 @@ def start_rtp_for_dialog(
     remote_port,
 ):
     dialog.remote_rtp = (remote_ip, remote_port)
-    dialog.rtp = RtpSession(
-        local_ip,
-        rtp_port,
-        payload_pt,
-        forced=True,
-    )
+    if dialog.mode == "inactive":
+        return
+    send_enabled = dialog.mode in ("sendrecv", "sendonly")
+    recv_enabled = dialog.mode in ("sendrecv", "recvonly")
+    force_silence = send_silence or dialog.mode == "sendonly"
+    dialog.rtp = RtpSession(local_ip, rtp_port, payload_pt, forced=True)
     dialog.rtp.tone_hz = tone_hz
-    dialog.rtp.send_silence = send_silence and not tone_hz
+    dialog.rtp.send_silence = force_silence and not tone_hz
+    dialog.rtp.set_sending(send_enabled)
+    dialog.rtp.set_receiving(recv_enabled)
     dialog.rtp.start(remote_ip, remote_port)
 
 
@@ -138,6 +175,304 @@ def clear_cancel_timer(dialog: SIPDialog):
         except Exception:
             pass
         dialog.timer_cancel = None
+
+
+def _extract_tag(header_value: str | None) -> str | None:
+    if not header_value:
+        return None
+    lower = header_value.lower()
+    if "tag=" not in lower:
+        return None
+    idx = lower.find("tag=")
+    tag = header_value[idx + 4 :]
+    for sep in (";", ">", " "):
+        if sep in tag:
+            tag = tag.split(sep, 1)[0]
+    return tag.strip() or None
+
+
+def _coerce_payloads(codecs):
+    if not codecs:
+        return [(0, "PCMU"), (8, "PCMA")]
+    if isinstance(codecs, str):
+        items = [c.strip().lower() for c in codecs.split(",") if c.strip()]
+    else:
+        items = list(codecs)
+    payloads = []
+    for item in items:
+        if isinstance(item, tuple) and len(item) >= 2:
+            payloads.append((int(item[0]), str(item[1]).upper()))
+            continue
+        if isinstance(item, str):
+            pt = PT_FROM_CODEC_NAME.get(item.lower())
+            if pt is not None:
+                payloads.append((pt, item.upper()))
+    return payloads or [(0, "PCMU"), (8, "PCMA")]
+
+
+def build_response_ok_from_request(request_data: bytes) -> bytes:
+    start, headers = parse_headers(request_data)
+    if not start:
+        return b""
+    resp_headers = {
+        "Via": headers.get("via", ""),
+        "From": headers.get("from", ""),
+        "To": headers.get("to", ""),
+        "Call-ID": headers.get("call-id", ""),
+        "CSeq": headers.get("cseq", ""),
+        "User-Agent": "Dimitri-4000/0.1",
+    }
+    return build_response(200, "OK", resp_headers)
+
+
+def build_bye_simple(
+    request_uri: str,
+    from_uri: str,
+    to_uri: str,
+    local_ip: str,
+    local_port: int,
+    call_id: str,
+    cseq: int,
+    from_tag: str,
+    to_tag: str | None,
+    contact_user: str,
+) -> bytes:
+    branch = "z9hG4bK" + uuid.uuid4().hex
+    from_hdr = f"<{from_uri}>;tag={from_tag}"
+    to_hdr = f"<{to_uri}>"
+    if to_tag:
+        to_hdr = f"{to_hdr};tag={to_tag}"
+    msg = (
+        f"BYE {request_uri} SIP/2.0\r\n"
+        f"Via: SIP/2.0/UDP {local_ip}:{local_port};branch={branch};rport\r\n"
+        "Max-Forwards: 70\r\n"
+        f"From: {from_hdr}\r\n"
+        f"To: {to_hdr}\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: {cseq} BYE\r\n"
+        f"Contact: <sip:{contact_user}@{local_ip}:{local_port}>\r\n"
+        "User-Agent: Dimitri-4000/0.1\r\n"
+        "Content-Length: 0\r\n\r\n"
+    )
+    return msg.encode()
+
+
+def generator_call_worker(sock, local_ip, dst_addr, base_args, per_call_args, stats_cb=None):
+    """
+    sock: UDP ya bindeado (puerto src)
+    dst_addr: (ip, port) destino
+    base_args: namespace global del generador
+    per_call_args: namespace con from_uri/to_uri, rtp_port, codecs, etc. de esta llamada
+    """
+    log = logging.getLogger("load-call")
+    start_ts = time.time()
+    call_id = f"{uuid.uuid4()}"
+    local_tag = secrets.token_hex(4)
+    dialog = SIPDialog(call_id, local_tag)
+
+    codecs = _coerce_payloads(
+        getattr(per_call_args, "codecs", None) or getattr(base_args, "codecs", None)
+    )
+    pt_prefer = codecs[0][0]
+    sdp_mode = getattr(per_call_args, "sdp_mode", None) or getattr(
+        base_args, "sdp_mode", None
+    )
+    if not sdp_mode:
+        sdp_mode = getattr(base_args, "sdp_direction", "sendrecv")
+    dialog.mode = sdp_mode
+    offer_sdp = build_sdp(
+        local_ip,
+        per_call_args.rtp_port,
+        codecs,
+        session_extras=getattr(base_args, "sdp_session_extras", []),
+        media_extras=getattr(base_args, "sdp_extras", []),
+        direction=sdp_mode,
+    )
+
+    cseq = dialog.cseq
+    branch = "z9hG4bK" + uuid.uuid4().hex
+    dialog.branch = branch
+    contact_user = getattr(per_call_args, "from_user", None) or "u"
+    local_port = getattr(per_call_args, "src_port", None) or sock.getsockname()[1]
+    invite = build_invite(
+        request_uri=per_call_args.to_uri,
+        from_uri=per_call_args.from_uri,
+        to_uri=per_call_args.to_uri,
+        local_ip=local_ip,
+        local_port=local_port,
+        call_id=call_id,
+        cseq=cseq,
+        tag=local_tag,
+        branch=branch,
+        sdp=offer_sdp,
+        contact_user=contact_user,
+        extra_headers=getattr(per_call_args, "extra_headers_list", []),
+    )
+    sock.sendto(invite, dst_addr)
+
+    ring_timeout = float(getattr(base_args, "ring_timeout", 10.0))
+    ring_deadline = time.time() + ring_timeout
+
+    established = False
+    bye_sent = False
+    setup_ms = 0
+    result = "aborted"
+    talk_time = float(getattr(base_args, "talk_time", 0) or 0)
+    max_call_time = float(getattr(base_args, "max_call_time", 0) or 0)
+    t_end = time.time() + talk_time if talk_time > 0 else None
+    max_end = time.time() + max_call_time if max_call_time > 0 else None
+
+    sock.settimeout(0.5)
+    while True:
+        now = time.time()
+        if not established and now > ring_deadline:
+            cancel = build_cancel(
+                request_uri=per_call_args.to_uri,
+                to_uri=per_call_args.to_uri,
+                local_ip=local_ip,
+                local_port=local_port,
+                from_uri=per_call_args.from_uri,
+                from_display=None,
+                call_id=call_id,
+                cseq=cseq,
+                tag=local_tag,
+                branch=branch,
+                contact_user=contact_user,
+            )
+            sock.sendto(cancel, dst_addr)
+            log.info("CANCEL enviado call-id=%s", call_id)
+            result = "canceled"
+            break
+
+        if established and talk_time > 0 and t_end and now >= t_end and not bye_sent:
+            bye = build_bye_simple(
+                request_uri=per_call_args.to_uri,
+                from_uri=per_call_args.from_uri,
+                to_uri=per_call_args.to_uri,
+                local_ip=local_ip,
+                local_port=local_port,
+                call_id=call_id,
+                cseq=dialog.cseq + 1,
+                from_tag=local_tag,
+                to_tag=dialog.remote_tag,
+                contact_user=contact_user,
+            )
+            sock.sendto(bye, dst_addr)
+            bye_sent = True
+            result = "max-time-bye"
+
+        if established and max_end and now >= max_end and not bye_sent:
+            bye = build_bye_simple(
+                request_uri=per_call_args.to_uri,
+                from_uri=per_call_args.from_uri,
+                to_uri=per_call_args.to_uri,
+                local_ip=local_ip,
+                local_port=local_port,
+                call_id=call_id,
+                cseq=dialog.cseq + 1,
+                from_tag=local_tag,
+                to_tag=dialog.remote_tag,
+                contact_user=contact_user,
+            )
+            sock.sendto(bye, dst_addr)
+            bye_sent = True
+            result = "max-time-bye"
+
+        try:
+            data, addr = sock.recvfrom(65535)
+        except socket.timeout:
+            continue
+        except OSError:
+            result = "aborted"
+            break
+
+        msg_start, headers = parse_headers(data)
+        if headers.get("call-id") != call_id:
+            continue
+
+        cseq_hdr = headers.get("cseq", "")
+        if msg_start.startswith("SIP/2.0") and "200" in msg_start and "INVITE" in cseq_hdr:
+            dialog.remote_tag = _extract_tag(headers.get("to"))
+            body = b""
+            if b"\r\n\r\n" in data:
+                body = data.split(b"\r\n\r\n", 1)[1]
+            sdp_text = body.decode("utf-8", "ignore")
+            rip, rport, _, mode = parse_sdp_for_audio(sdp_text)
+            dialog.mode = mode or dialog.mode
+            ack = build_ack(
+                request_uri=per_call_args.to_uri,
+                to_header=headers.get("to", f"<{per_call_args.to_uri}>"),
+                local_ip=local_ip,
+                local_port=local_port,
+                from_uri=per_call_args.from_uri,
+                from_display=None,
+                call_id=call_id,
+                cseq=cseq,
+                tag=local_tag,
+                contact_user=contact_user,
+            )
+            sock.sendto(ack, dst_addr)
+            dialog.ack_sent = True
+            established = True
+            dialog.established = True
+            setup_ms = int((time.time() - start_ts) * 1000)
+            if result == "aborted":
+                result = "answered"
+            if rip and rport:
+                try:
+                    start_rtp_for_dialog(
+                        dialog,
+                        local_ip,
+                        per_call_args.rtp_port,
+                        pt_prefer,
+                        getattr(base_args, "rtp_tone", 0) or 0,
+                        bool(getattr(base_args, "rtp_send_silence", False)),
+                        rip,
+                        rport,
+                    )
+                except Exception as exc:
+                    log.warning("RTP no pudo iniciar call-id=%s: %s", call_id, exc)
+                log.info("ACK enviado y RTP iniciado call-id=%s -> %s:%s", call_id, rip, rport)
+            if stats_cb:
+                try:
+                    stats_cb(
+                        {
+                            "type": "uac_established",
+                            "call_id": call_id,
+                            "local_port": local_port,
+                            "remote_ip": rip,
+                            "remote_port": rport,
+                        }
+                    )
+                except Exception:
+                    pass
+            continue
+
+        if msg_start.startswith("BYE "):
+            resp = build_response_ok_from_request(data)
+            if resp:
+                sock.sendto(resp, addr)
+            stop_rtp_for_dialog(dialog)
+            log.info("BYE remoto atendido call-id=%s", call_id)
+            result = "remote-bye" if established else "aborted"
+            break
+
+        if msg_start.startswith("SIP/2.0") and "200" in msg_start and "BYE" in cseq_hdr:
+            stop_rtp_for_dialog(dialog)
+            log.info("200 OK a BYE recibido call-id=%s", call_id)
+            if result == "aborted":
+                result = "max-time-bye" if bye_sent else "answered"
+            break
+
+    stop_rtp_for_dialog(dialog)
+    if stats_cb and established:
+        try:
+            stats_cb({"type": "uac_ended", "call_id": call_id})
+        except Exception:
+            pass
+    if not established and result == "aborted":
+        result = "aborted"
+    return call_id, result, setup_ms, dialog
 
 
 def sanitize_extra_headers(raw, *, log=None) -> list[str]:
@@ -667,7 +1002,9 @@ def run_load_generator(args, sip_manager, stats_cb=None):
         step = 1
     args.pad_width = pad_width
     args.number_step = step
-    fixed_numbers = bool(getattr(args, "fixed_numbers", False))
+    fixed_numbers = bool(getattr(args, "use_fixed_numbers", False))
+    if not fixed_numbers:
+        fixed_numbers = bool(getattr(args, "fixed_numbers", False))
 
     to_start = int(args.to_number_start or 0)
     from_start = int(args.from_number_start or 0)
@@ -723,6 +1060,31 @@ def run_load_generator(args, sip_manager, stats_cb=None):
     def format_num(num):
         return str(num).zfill(pad_width) if pad_width > 0 else str(num)
 
+    shared_sock = None
+    if not args.src_port_base:
+        try:
+            shared_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            shared_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            shared_sock.bind((args.bind_ip or "0.0.0.0", getattr(args, "src_port", 0) or 0))
+        except OSError as e:
+            logger.error(
+                f"No se pudo bindear UDP en {args.bind_ip or '0.0.0.0'}:{getattr(args, 'src_port', 0)}: {e}"
+            )
+            raise SystemExit(1)
+
+    def _resolve_local_ip(sock):
+        if args.bind_ip and args.bind_ip != "0.0.0.0":
+            return args.bind_ip
+        local_ip = sock.getsockname()[0]
+        if local_ip == "0.0.0.0":
+            try:
+                sock.connect((dst, dport))
+                local_ip = sock.getsockname()[0]
+                sock.connect(("0.0.0.0", 0))
+            except Exception:
+                local_ip = sock.getsockname()[0]
+        return local_ip
+
     def worker(i):
         nonlocal counters
         call_args = make_per_call_args(
@@ -754,6 +1116,9 @@ def run_load_generator(args, sip_manager, stats_cb=None):
         call_args.from_uri, call_args.to_uri, call_args.extra_headers_list = build_identities(
             call_args
         )
+        call_args.sdp_mode = getattr(args, "sdp_mode", None) or getattr(
+            args, "sdp_direction", "sendrecv"
+        )
 
         from_uri = _norm_sip_uri(
             call_args.from_user,
@@ -779,90 +1144,48 @@ def run_load_generator(args, sip_manager, stats_cb=None):
         if rtp_port % 2:
             rtp_port += 1
         ts = datetime.now(UTC).isoformat()
-        attempts = 0
+        call_args.rtp_port = rtp_port
+        call_args.src_port = src_port if src_port else None
         send_silence = bool(
             getattr(args, "rtp_send_silence", False)
             or getattr(args, "rtp_always_silence", False)
         )
-        while True:
-            try:
-                call_id, result, setup_ms, _ = sip_manager.place_call(
-                    dst_host=dst,
-                    dst_port=dport,
-                    from_uri=from_uri,
-                    to_uri=final_to_uri,
-                    bind_ip=args.bind_ip,
-                    bind_port=src_port,
-                    timeout=args.timeout,
-                    ring_timeout=args.ring_timeout,
-                    talk_time=(0 if getattr(args, "talk_time", 0) in (None, 0) else args.talk_time),
-                    wait_bye=args.wait_bye,
-                    max_call_time=args.max_call_time,
-                    codecs=args.codecs,
-                    rtp_port=rtp_port,
-                    rtp_port_forced=True,
-                    rtcp=args.rtcp,
-                    tone_hz=args.rtp_tone,
-                    send_silence=send_silence,
-                    symmetric=args.symmetric_rtp,
-                    stats_interval=args.rtp_stats_every,
-                    extra_headers=call_args.extra_headers_list or base_extra_headers,
-                    sdp_direction=sdp_direction,
-                    sdp_media_extras=sdp_media_extras,
-                    sdp_session_extras=sdp_session_extras,
-                )
-                break
-            except OSError as e:
-                if e.errno == errno.EADDRINUSE and attempts < 5:
-                    src_port = src_port + args.src_port_step if args.src_port_base else 0
-                    rtp_port += args.rtp_port_step
-                    attempts += 1
-                    continue
-                call_id = ""
-                result = f"error({e.errno})"
-                setup_ms = 0
-                break
-            except Exception as e:
-                logger.error(f"LOAD: error en llamada: {e}")
-                with lock:
-                    counters["aborted"] += 1
-                    active.discard(threading.current_thread())
-                return
+        call_args.rtp_send_silence = send_silence
+        call_args.codecs = args.codecs
+        call_args.extra_headers_list = call_args.extra_headers_list or base_extra_headers
 
-        send_established = result in ("answered", "canceled-after-200")
-        if stats_cb and send_established:
-            dialog = sip_manager.uac_dialogs.get(call_id)
-            remote_ip = remote_port = None
-            local_p = src_port
-            if dialog:
-                local_p = dialog.local_port
-                if dialog.rtp and dialog.rtp.remote_addr:
-                    remote_ip, remote_port = dialog.rtp.remote_addr
-            try:
-                stats_cb(
-                    {
-                        "type": "uac_established",
-                        "call_id": call_id,
-                        "local_port": local_p,
-                        "remote_ip": remote_ip,
-                        "remote_port": remote_port,
-                    }
-                )
-            except Exception:
-                pass
-            should_end = result == "canceled-after-200" or (
-                getattr(args, "talk_time", 0) and args.talk_time > 0
+        try:
+            if call_args.src_port:
+                s_worker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s_worker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s_worker.bind((args.bind_ip or "0.0.0.0", int(call_args.src_port)))
+            else:
+                s_worker = shared_sock
+            local_ip = _resolve_local_ip(s_worker)
+            call_id, result, setup_ms, dialog = generator_call_worker(
+                s_worker,
+                local_ip,
+                (dst, int(dport)),
+                args,
+                call_args,
+                stats_cb=stats_cb,
             )
-            if should_end:
+        except OSError as e:
+            call_id = ""
+            result = f"error({getattr(e, 'errno', 'socket')})"
+            setup_ms = 0
+        except Exception as e:
+            logger.error(f"LOAD: error en llamada: {e}")
+            with lock:
+                counters["aborted"] += 1
+                active.discard(threading.current_thread())
+            return
+        finally:
+            if call_args.src_port and s_worker:
                 try:
-                    stats_cb({"type": "uac_ended", "call_id": call_id})
+                    s_worker.close()
                 except Exception:
                     pass
-        elif stats_cb and result in ("remote-bye", "max-time-bye"):
-            try:
-                stats_cb({"type": "uac_ended", "call_id": call_id})
-            except Exception:
-                pass
 
         write_csv_row(
             "calls_summary.csv",
@@ -946,6 +1269,11 @@ def run_load_generator(args, sip_manager, stats_cb=None):
         t.join()
     stop.set()
     printer_t.join()
+    if shared_sock:
+        try:
+            shared_sock.close()
+        except Exception:
+            pass
     if stats_cb:
         with lock:
             final = counters.copy()
