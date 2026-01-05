@@ -1791,15 +1791,15 @@ class SIPManager:
         for key, dlg in list(dialogs.items()):
             dst = getattr(dlg, "dst", None)
             try:
-            if dst and dlg.sock:
-                fallback_ip, fallback_port = self._local_ip_port(
-                    dlg.sock, dst[0], dst[1]
-                )
-                src_ip, src_port = self._sip_ip_port(
-                    fallback_ip, fallback_port
-                )
-            else:
-                src_ip, src_port = dlg.local_ip, dlg.local_port
+                if dst and dlg.sock:
+                    fallback_ip, fallback_port = self._local_ip_port(
+                        dlg.sock, dst[0], dst[1]
+                    )
+                    src_ip, src_port = self._sip_ip_port(
+                        fallback_ip, fallback_port
+                    )
+                else:
+                    src_ip, src_port = dlg.local_ip, dlg.local_port
                 bye_text = build_bye_request(
                     dlg, src_ip, src_port, transport=self.protocol.upper()
                 )
@@ -1810,11 +1810,27 @@ class SIPManager:
                     dlg.call_id,
                     req_line,
                 )
-                payload = bye_text.encode()
-                if dst and dlg.sock:
-                    dlg.sock.sendto(payload, dst)
-                elif dlg.sock:
-                    dlg.sock.send(payload)
+                pkt = bye_text.encode()
+                first_line = req_line
+                try:
+                    if dst and dlg.sock:
+                        dlg.sock.sendto(pkt, dst)
+                        self.logger.debug("SIP tx to %s: %s", dst, first_line)
+                    else:
+                        self.logger.warning(
+                            "No se puede enviar: dst=%r sock=%r",
+                            dst,
+                            getattr(dlg, "sock", None),
+                        )
+                except OSError as send_error:
+                    self.logger.exception(
+                        "Error OS enviando SIP a %s: %s", dst, send_error
+                    )
+                except Exception as send_error:
+                    self.logger.exception(
+                        "Error enviando SIP a %s: %s", dst, send_error
+                    )
+                    raise
                 if dlg.sock:
                     dlg.sock.settimeout(timeout)
                     try:
@@ -1824,7 +1840,9 @@ class SIPManager:
                             if code == 200:
                                 break
                     except socket.timeout:
-                        pass
+                        self.logger.debug(
+                            "Timeout esperando 200 OK BYE call_id=%s", dlg.call_id
+                        )
             except OSError as e:
                 self.logger.error(f"UAC BYE error call_id={dlg.call_id}: {e}")
             finally:
